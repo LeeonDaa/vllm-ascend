@@ -178,7 +178,16 @@ class KVPoolWorker:
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
         self.use_hybrid = uses_hybrid_kv_cache(vllm_config.scheduler_config, kv_cache_groups)
         if self.backend_name == "mooncake" and self.use_layerwise and self.use_hybrid:
-            raise ValueError("Mooncake layerwise does not yet support hybrid or multi-group KV cache layouts")
+            # M2a: multi-group Mooncake layerwise is wired with one
+            # group-qualified object per (group, block chunk, rank). It is
+            # experimental: deployments must run the same vllm-ascend version
+            # on every P/D process and rely on block-aligned token boundaries
+            # (partial last-block keys are unsupported for hybrid layouts).
+            logger.warning(
+                "Mooncake layerwise hybrid/multi-group KV is experimental (M2a); "
+                "ensure identical vllm-ascend versions across the cluster and "
+                "block-aligned prefill boundaries."
+            )
         self.use_mamba = self._uses_mamba_kv_cache(self.use_hybrid, kv_cache_config)
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
