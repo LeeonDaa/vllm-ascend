@@ -589,6 +589,10 @@ class TestMooncakeMultiGroupLayerwise(unittest.TestCase):
                         use_key_major_ranges=True,
                     )
                 )
+            # Mirror the run loop: task_done() inside _handle_request must pair
+            # with one get() per queued batch.
+            thread.request_queue.put(tasks)
+            thread.request_queue.get()
             thread._handle_request(tasks)
 
         store.batch_commit.assert_has_calls(
