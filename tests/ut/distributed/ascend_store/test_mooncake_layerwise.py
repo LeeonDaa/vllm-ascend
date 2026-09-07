@@ -30,11 +30,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ChunkedTokenDatabase,
     KeyMetadata,
+    LayerwiseBlockKey,
     LayerBlockRange,
     LayerRangeReqMeta,
     LayerTransferTask,
     LoadSpec,
     ReqMeta,
+    make_layerwise_block_key,
+    parse_layerwise_block_key,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mooncake_session_tracker import (
     MooncakeSessionTracker,
@@ -362,6 +365,82 @@ class TestMooncakeSessionTracker(unittest.TestCase):
         tracker.record_get_result("k0", ["r1"], succeeded=True)
         self.assertEqual(tracker.release_terminal({"r1"}), ["k0"])
         self.assertEqual(tracker.prepare_load_entries("r1", []), [])
+
+
+class TestMooncakeLayerwiseGroupKeys(unittest.TestCase):
+    """M2a foundation: group-qualified Mooncake layerwise block keys.
+
+    The default group must keep the legacy ``model@hash@rank`` key so existing
+    stored objects stay readable; multi-group layouts (DeepSeek-V4-Flash)
+    qualify the key with group/cache_role/cache_family.
+    """
+
+    def test_legacy_default_key_unchanged(self):
+        key = make_layerwise_block_key("model", "abc123", 3)
+        self.assertEqual(key, "model@abc123@3")
+        self.assertEqual(
+            parse_layerwise_block_key(key),
+            LayerwiseBlockKey("model", 0, "kv", "default", "abc123", 3),
+        )
+
+    def test_group_qualified_key_roundtrip(self):
+        key = make_layerwise_block_key(
+            "dsv4",
+            "feed00",
+            1,
+            kv_cache_group_id=2,
+            cache_role="state",
+            cache_family="c4",
+        )
+        self.assertEqual(key, "dsv4@group:2@cache_role:state@cache_family:c4@feed00@1")
+        self.assertEqual(
+            parse_layerwise_block_key(key),
+            LayerwiseBlockKey("dsv4", 2, "state", "c4", "feed00", 1),
+        )
+
+    def test_group_qualified_keys_do_not_collide(self):
+        keys = {
+            make_layerwise_block_key(
+                "model",
+                "hash",
+                rank,
+                kv_cache_group_id=group_id,
+                cache_role=cache_role,
+                cache_family=cache_family,
+            )
+            for group_id in (0, 1, 2)
+            for cache_role in ("kv", "state")
+            for cache_family in ("default", "c4", "c128")
+            for rank in (0, 1)
+        }
+        legacy_key = make_layerwise_block_key("model", "hash", 0)
+        self.assertNotIn(legacy_key, keys)
+        self.assertEqual(
+            len(keys),
+            3 * 2 * 3 * 2,
+        )
+
+    def test_group_qualified_lastblock_key_roundtrip(self):
+        key = make_layerwise_block_key(
+            "dsv4",
+            "req-1_lastblock",
+            0,
+            kv_cache_group_id=1,
+            cache_role="kv",
+            cache_family="default",
+        )
+        parsed = parse_layerwise_block_key(key)
+        self.assertEqual(parsed.chunk_hash, "req-1_lastblock")
+        self.assertEqual(parsed.kv_cache_group_id, 1)
+
+    def test_group_object_size_bytes(self):
+        worker = object.__new__(KVPoolWorker)
+        worker.group_block_len = {0: [10, 20], 1: [8]}
+        worker.page_size_bytes = 64
+        worker.num_kv_cache_groups = 2
+        self.assertEqual(worker._mooncake_object_size_bytes(0), 30)
+        self.assertEqual(worker._mooncake_object_size_bytes(1), 8)
+        self.assertEqual(worker._mooncake_object_size_per_group(), [30, 8])
 
 
 if __name__ == "__main__":

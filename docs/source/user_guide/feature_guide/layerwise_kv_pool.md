@@ -267,8 +267,12 @@ wait/save calls. Layerwise + CP is future work.
 * **Mooncake topology**: The current block key is TP-only. Pipeline parallel,
   prefill-context parallel, and decode-context parallel sizes must all be `1`.
   Prefill/decode TP mismatch is also rejected.
-* **Mooncake hybrid KV cache**: Multiple KV-cache groups are rejected until
-  the remote object schema records per-group layout and completeness.
+* **Mooncake hybrid KV cache**: Multiple KV-cache groups are rejected until the
+  per-group object schema (one object per `(kv_cache_group, block chunk,
+  saving rank)`, keyed by `@group/@cache_role/@cache_family`) is wired through
+  the Mooncake range-session save/load path. The key model and per-group object
+  sizing helpers are in place; full DSV4 session/thread wiring is tracked by the
+  M2a follow-up and must not be enabled before it lands.
 * **Context parallel**: Layerwise is not yet integrated with CP attention
   backends.
 * **PD disaggregation proxy**: When using `kv_producer` / `kv_consumer`, the

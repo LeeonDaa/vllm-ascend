@@ -1616,12 +1616,25 @@ class KVPoolWorker:
             )
         return results
 
-    def _mooncake_object_size_bytes(self) -> int:
-        group_block_len = getattr(self, "group_block_len", {}).get(0, [])
+    def _mooncake_object_size_bytes(self, group_id: int = 0) -> int:
+        """Byte size of one Mooncake layerwise object for ``group_id``.
+
+        One object stores every physical layer of a single KV-cache group for
+        one block chunk, so the object size is the group's per-block layer byte
+        length. The default group keeps the historical single-group object
+        size; multi-group layouts (DeepSeek-V4-Flash) compute it per group.
+        """
+        group_block_len = getattr(self, "group_block_len", {}).get(group_id, [])
         object_size = sum(group_block_len) if group_block_len else self.page_size_bytes
         if object_size <= 0:
-            raise RuntimeError(f"Mooncake layerwise object size must be positive, got {object_size}")
+            raise RuntimeError(
+                f"Mooncake layerwise object size must be positive for group {group_id}, got {object_size}"
+            )
         return object_size
+
+    def _mooncake_object_size_per_group(self) -> list[int]:
+        """Per-group object sizes for group-qualified Mooncake layerwise keys."""
+        return [self._mooncake_object_size_bytes(group_id) for group_id in range(self.num_kv_cache_groups)]
 
     def _queue_layerwise_revoke_keys(self, keys: list[str]) -> None:
         if not keys:

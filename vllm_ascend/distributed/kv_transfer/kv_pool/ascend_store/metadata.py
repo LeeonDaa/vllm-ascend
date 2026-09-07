@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -16,13 +17,63 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
 
 
+@dataclass(frozen=True)
+class LayerwiseBlockKey:
+    """Decomposed Mooncake layerwise block-key for one (group, chunk, rank)."""
+
+    model_name: str
+    kv_cache_group_id: int
+    cache_role: str
+    cache_family: str
+    chunk_hash: str
+    head_or_tp_rank: int
+
+
 def make_layerwise_block_key(
     model_name: str,
     block_hash_or_tail: str,
     head_or_tp_rank: int,
+    kv_cache_group_id: int = 0,
+    cache_role: str = "kv",
+    cache_family: str = "default",
 ) -> str:
-    """Build the canonical one-object-per-block-and-saving-rank key."""
-    return f"{model_name}@{block_hash_or_tail}@{head_or_tp_rank}"
+    """Build the canonical one-object-per-block-and-saving-rank key.
+
+    The default group (group 0, ``kv``/``default``) keeps the legacy
+    ``model@hash@rank`` format so existing stored objects stay readable.
+    Multi-group/hybrid layouts (e.g. DeepSeek-V4-Flash) qualify the key with
+    ``@group:@cache_role:@cache_family`` so each group gets its own object per
+    block chunk and saving rank.
+    """
+    if kv_cache_group_id == 0 and cache_role == "kv" and cache_family == "default":
+        return f"{model_name}@{block_hash_or_tail}@{head_or_tp_rank}"
+    return (
+        f"{model_name}@group:{kv_cache_group_id}@cache_role:{cache_role}"
+        f"@cache_family:{cache_family}@{block_hash_or_tail}@{head_or_tp_rank}"
+    )
+
+
+def parse_layerwise_block_key(key: str) -> LayerwiseBlockKey:
+    """Parse a key produced by :func:`make_layerwise_block_key`."""
+    if "@group:" not in key:
+        model_name, chunk_hash, rank = key.rsplit("@", 2)
+        return LayerwiseBlockKey(model_name, 0, "kv", "default", chunk_hash, int(rank))
+
+    head, chunk_hash, rank = key.rsplit("@", 2)
+    model_name = head.split("@group:", 1)[0]
+    group_match = re.search(r"@group:(\d+)", head)
+    role_match = re.search(r"@cache_role:([^@]+)", head)
+    family_match = re.search(r"@cache_family:([^@]+)", head)
+    if group_match is None or role_match is None or family_match is None:
+        raise ValueError(f"Invalid group-qualified layerwise block key: {key}")
+    return LayerwiseBlockKey(
+        model_name=model_name,
+        kv_cache_group_id=int(group_match.group(1)),
+        cache_role=role_match.group(1),
+        cache_family=family_match.group(1),
+        chunk_hash=chunk_hash,
+        head_or_tp_rank=int(rank),
+    )
 
 
 def is_block_key_layerwise(use_layerwise: bool, backend_name: str) -> bool:
