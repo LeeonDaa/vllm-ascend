@@ -919,3 +919,31 @@ curl http://192.0.0.1:8080/v1/completions \
         "temperature": 0
     }'
 ```
+
+## MooncakeHybridConnector Layerwise Mode (M1)
+
+`MooncakeHybridConnector` accepts a `use_layerwise` switch in
+`kv_connector_extra_config`. The M1 change only adds the option and startup
+validation; requests still use the existing request-level bulk transfer until
+the per-layer P2P pull path lands (M2).
+
+```json
+{
+    "kv_connector": "MooncakeHybridConnector",
+    "kv_role": "kv_consumer",
+    "engine_id": "1",
+    "kv_port": "36020",
+    "kv_connector_extra_config": {
+        "use_layerwise": true,
+        "prefill": {"dp_size": 1, "tp_size": 4},
+        "decode": {"dp_size": 4, "tp_size": 1}
+    }
+}
+```
+
+Validation follows the eric-dot/mooncake KV-pool layerwise port: the mode is
+accepted only for single KV-cache-group layouts with PP/PCP/DCP=1 and no
+Mamba/SSM or compressed (DeepSeek-V4-Flash) KV. Unsupported layouts fail fast
+at startup with an actionable error. DeepSeek-V4-Flash multi-group layerwise
+requires the per-group layer-offset mapping and is tracked as the M2 follow-up;
+keep `use_layerwise: false` for DSV4 deployments.

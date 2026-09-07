@@ -1051,6 +1051,70 @@ class KVCacheRecvingThread(threading.Thread):
             self.remote_sockets[remote_path].append(sock)
 
 
+def _get_use_layerwise(extra_config: dict[str, Any]) -> bool:
+    """Read the MooncakeHybridConnector layerwise switch from extra config."""
+    return bool((extra_config or {}).get("use_layerwise", False))
+
+
+def validate_mooncake_hybrid_layerwise(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig | None,
+) -> None:
+    """Fail fast for layouts unsupported by MooncakeHybridConnector layerwise mode.
+
+    Follows the eric-dot/mooncake KV-pool layerwise port philosophy: only enable
+    layerwise for topologies whose per-layer P2P address slices are unambiguous,
+    and reject unsupported layouts at startup instead of failing mid-request.
+    Multi-group/compressed layouts (e.g. DeepSeek-V4-Flash) need the per-group
+    layer-offset mapping and are the planned follow-up (M2).
+    """
+    if kv_cache_config is None:
+        return
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if parallel_config is not None:
+        unsupported = []
+        for name in (
+            "pipeline_parallel_size",
+            "prefill_context_parallel_size",
+            "decode_context_parallel_size",
+        ):
+            value = getattr(parallel_config, name, 1)
+            if isinstance(value, int) and value > 1:
+                unsupported.append(f"{name}={value}")
+        if unsupported:
+            raise ValueError(
+                "MooncakeHybridConnector use_layerwise supports only PP/PCP/DCP=1 "
+                "topologies; got " + ", ".join(unsupported) + "."
+            )
+
+    groups = getattr(kv_cache_config, "kv_cache_groups", None) or []
+    if len(groups) != 1:
+        raise NotImplementedError(
+            "MooncakeHybridConnector use_layerwise requires a single KV-cache group; "
+            f"got {len(groups)} groups. DeepSeek-V4-Flash (DSV4) multi-group "
+            "layerwise is the planned M2 follow-up and must keep use_layerwise=false "
+            "for now."
+        )
+
+    group_spec = groups[0].kv_cache_spec
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        group_spec = next(iter(group_spec.kv_cache_specs.values()))
+    if isinstance(group_spec, MambaSpec):
+        raise NotImplementedError(
+            "MooncakeHybridConnector use_layerwise does not yet support "
+            "Mamba/SSM KV layouts."
+        )
+
+    hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+    if hf_config is not None and hasattr(hf_config, "compress_ratios"):
+        raise NotImplementedError(
+            "MooncakeHybridConnector use_layerwise does not yet support "
+            "compressed/DSV4 KV layouts; keep use_layerwise=false until the "
+            "multi-group layerwise mapping lands."
+        )
+
+
 class MooncakeConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.requests: dict[str, ReqMeta] = {}
@@ -1086,6 +1150,16 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_transfer_config = vllm_config.kv_transfer_config
         self.engine_id = vllm_config.kv_transfer_config.engine_id
         self._connector_metadata = MooncakeConnectorMetadata()
+        self.use_layerwise = _get_use_layerwise(vllm_config.kv_transfer_config.kv_connector_extra_config)
+        if self.use_layerwise:
+            # M1: option parsing + startup validation only. The per-layer P2P pull
+            # path is the M2 follow-up; until then requests still use the existing
+            # request-level bulk transfer.
+            validate_mooncake_hybrid_layerwise(vllm_config, kv_cache_config)
+            logger.info(
+                "MooncakeHybridConnector layerwise mode is enabled (single-group "
+                "layouts only; per-layer P2P pull is the M2 follow-up)."
+            )
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MooncakeConnectorScheduler | None = MooncakeConnectorScheduler(

@@ -14,12 +14,15 @@ fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
 sys.modules["mooncake.engine"] = fake_engine
 
+from vllm.v1.kv_cache_interface import MambaSpec  # noqa: E402
 from vllm.v1.request import RequestStatus  # noqa: E402
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import (  # noqa: E402
     MAX_REQUESTS_PER_PEER_HANDLER,
     KVCacheRecvingThread,
     MooncakeConnectorScheduler,
+    _get_use_layerwise,
+    validate_mooncake_hybrid_layerwise,
 )
 
 
@@ -317,3 +320,79 @@ class TestMooncakeHybridConnectorScheduler(unittest.TestCase):
         self.assertIsNotNone(params)
         self.assertEqual(params["remote_block_ids"], ([0], [100, 101]))
         self.assertEqual(params["num_prompt_blocks"], 2)
+
+
+class TestMooncakeHybridLayerwiseValidation(unittest.TestCase):
+    """M1 gate for MooncakeHybridConnector layerwise mode.
+
+    M1 adds option parsing and eric-dot/mooncake style fail-fast validation.
+    Per-layer P2P pulls for supported single-group layouts and the DSV4
+    multi-group offset mapping are follow-ups.
+    """
+
+    @staticmethod
+    def _vllm_config(compress=False, pp=1, pcp=1, dcp=1):
+        hf_config = types.SimpleNamespace()
+        if compress:
+            hf_config = types.SimpleNamespace(compress_ratios=[4])
+        return types.SimpleNamespace(
+            model_config=types.SimpleNamespace(hf_config=hf_config),
+            parallel_config=types.SimpleNamespace(
+                pipeline_parallel_size=pp,
+                prefill_context_parallel_size=pcp,
+                decode_context_parallel_size=dcp,
+            ),
+        )
+
+    @staticmethod
+    def _kv_cache_config(group_specs):
+        return types.SimpleNamespace(
+            kv_cache_groups=[types.SimpleNamespace(kv_cache_spec=spec) for spec in group_specs]
+        )
+
+    def test_use_layerwise_flag_parsing(self):
+        self.assertFalse(_get_use_layerwise(None))
+        self.assertFalse(_get_use_layerwise({}))
+        self.assertFalse(_get_use_layerwise({"backend": "mooncake"}))
+        self.assertFalse(_get_use_layerwise({"use_layerwise": False}))
+        self.assertTrue(_get_use_layerwise({"use_layerwise": True}))
+        self.assertTrue(_get_use_layerwise({"use_layerwise": "true"}))
+
+    def test_accepts_single_group_mla_layout(self):
+        validate_mooncake_hybrid_layerwise(
+            self._vllm_config(),
+            self._kv_cache_config([object()]),
+        )
+
+    def test_none_kv_cache_config_is_noop(self):
+        # Config validation only matters after the KV cache config is resolved.
+        validate_mooncake_hybrid_layerwise(self._vllm_config(compress=True), None)
+
+    def test_rejects_multi_group_dsv4_layout(self):
+        with self.assertRaisesRegex(NotImplementedError, "single KV-cache group"):
+            validate_mooncake_hybrid_layerwise(
+                self._vllm_config(compress=True),
+                self._kv_cache_config([object(), object()]),
+            )
+
+    def test_rejects_compress_single_group_layout(self):
+        with self.assertRaisesRegex(NotImplementedError, "compressed/DSV4"):
+            validate_mooncake_hybrid_layerwise(
+                self._vllm_config(compress=True),
+                self._kv_cache_config([object()]),
+            )
+
+    def test_rejects_mamba_layout(self):
+        mamba_spec = MambaSpec.__new__(MambaSpec)
+        with self.assertRaisesRegex(NotImplementedError, "Mamba/SSM"):
+            validate_mooncake_hybrid_layerwise(
+                self._vllm_config(),
+                self._kv_cache_config([mamba_spec]),
+            )
+
+    def test_rejects_pp_topology(self):
+        with self.assertRaisesRegex(ValueError, "PP/PCP/DCP=1"):
+            validate_mooncake_hybrid_layerwise(
+                self._vllm_config(pp=2),
+                self._kv_cache_config([object()]),
+            )
