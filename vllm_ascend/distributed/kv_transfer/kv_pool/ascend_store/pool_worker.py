@@ -1800,7 +1800,7 @@ class KVPoolWorker:
         return (
             self.backend_name == "mooncake"
             and self.use_block_key_layerwise
-            and self.num_kv_cache_groups > 1
+            and getattr(self, "num_kv_cache_groups", 1) > 1
         )
 
     def _group_key_metadata(self, group_id: int) -> tuple[str, str]:

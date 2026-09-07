@@ -412,13 +412,13 @@ class TestMooncakeLayerwiseGroupKeys(unittest.TestCase):
             for cache_role in ("kv", "state")
             for cache_family in ("default", "c4", "c128")
             for rank in (0, 1)
+            if not (group_id == 0 and cache_role == "kv" and cache_family == "default")
         }
         legacy_key = make_layerwise_block_key("model", "hash", 0)
         self.assertNotIn(legacy_key, keys)
-        self.assertEqual(
-            len(keys),
-            3 * 2 * 3 * 2,
-        )
+        # The default (group 0, kv, default) combination intentionally keeps the
+        # legacy key format, so it contributes 2 of the 36 rank-key variants.
+        self.assertEqual(len(keys), 3 * 2 * 3 * 2 - 2)
 
     def test_group_qualified_lastblock_key_roundtrip(self):
         key = make_layerwise_block_key(
