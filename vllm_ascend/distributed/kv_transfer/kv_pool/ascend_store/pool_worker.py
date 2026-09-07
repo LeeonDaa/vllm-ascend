@@ -440,6 +440,24 @@ class KVPoolWorker:
         self.layer_load_finished_events: list[threading.Event] | None = None
         self.layer_save_finished_events: list[threading.Event] | None = None
 
+        # Final physical layer for each KV-cache group. Single-group layouts
+        # keep the historical global-commit path (None); multi-group Mooncake
+        # layerwise commits every group object at the group's own final layer.
+        if self.num_kv_cache_groups > 1:
+            self.group_final_layer_ids = [
+                max(
+                    (
+                        physical_layer
+                        for physical_layer, group_layers in self.physical_layer_to_group_layers.items()
+                        if any(group_id == entry_group for entry_group, _ in group_layers)
+                    ),
+                    default=self.num_layers - 1,
+                )
+                for group_id in range(self.num_kv_cache_groups)
+            ]
+        else:
+            self.group_final_layer_ids = None
+
         self.next_layer_to_submit = 0
         self.layerwise_offload = False
         self.independent_layers: list[int] = []
@@ -526,6 +544,11 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
+                    group_final_layer_ids=(
+                        self.group_final_layer_ids
+                        if self.backend_name == "mooncake" and self.num_kv_cache_groups > 1
+                        else None
+                    ),
                     put_started_keys=self._put_started_keys,
                     put_started_keys_lock=self._put_started_keys_lock,
                     session_tracker=self._mooncake_session_tracker if self.backend_name == "mooncake" else None,
@@ -569,6 +592,11 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
+                    group_final_layer_ids=(
+                        self.group_final_layer_ids
+                        if self.backend_name == "mooncake" and self.num_kv_cache_groups > 1
+                        else None
+                    ),
                     external_slot_release_waiter=self.external_slot_release_waiter,
                     save_failure_checker=(
                         self.kv_send_thread.raise_if_failed if self.kv_send_thread is not None else None
