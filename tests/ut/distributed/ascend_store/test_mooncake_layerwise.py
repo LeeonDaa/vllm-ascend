@@ -17,7 +17,9 @@
 
 import threading
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
+
+import numpy as np
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -30,11 +32,12 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ChunkedTokenDatabase,
     KeyMetadata,
-    LayerwiseBlockKey,
     LayerBlockRange,
     LayerRangeReqMeta,
     LayerTransferTask,
+    LayerwiseBlockKey,
     LoadSpec,
+    SharedBlockData,
     ReqMeta,
     make_layerwise_block_key,
     parse_layerwise_block_key,
@@ -441,6 +444,160 @@ class TestMooncakeLayerwiseGroupKeys(unittest.TestCase):
         self.assertEqual(worker._mooncake_object_size_bytes(0), 30)
         self.assertEqual(worker._mooncake_object_size_bytes(1), 8)
         self.assertEqual(worker._mooncake_object_size_per_group(), [30, 8])
+
+
+class TestMooncakeMultiGroupLayerwise(unittest.TestCase):
+    """M2a multi-group wiring: per-group keys, sessions and commits."""
+
+    @staticmethod
+    def _make_multi_group_worker() -> KVPoolWorker:
+        worker = TestMooncakeWorkerSessionPreparation._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.grouped_block_size = [16, 16]
+        worker.kv_cache_group_families = ["default", "c4"]
+        worker.group_block_len = {0: [10, 20, 30], 1: [4, 4]}
+        return worker
+
+    def test_request_block_keys_select_by_group(self):
+        request = ReqMeta("r1", block_ids=[])
+        request.save_block_keys_by_group = [["a0"], ["b0"]]
+        request.save_key_block_offset_by_group = [0, 0]
+        self.assertEqual(
+            LayerBatchBuilder._request_block_keys(request, is_save=True, group_id=1),
+            (["b0"], 0, None),
+        )
+        legacy = ReqMeta("r2", block_ids=[])
+        legacy.save_block_keys = ["x"]
+        legacy.save_key_block_offset = 2
+        self.assertEqual(
+            LayerBatchBuilder._request_block_keys(legacy, is_save=True, group_id=0),
+            (["x"], 2, None),
+        )
+
+    def test_multi_group_put_session_uses_group_qualified_keys(self):
+        worker = self._make_multi_group_worker()
+        worker.m_store.batch_put_start.return_value = [0]
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            save_start_token=0,
+            save_end_token=32,
+            block_ids=[1, 2],
+            block_hashes=[b"h0"],
+            can_save=True,
+        )
+
+        worker._prepare_mooncake_multi_group_put_session(request)
+
+        calls = worker.m_store.batch_put_start.call_args_list
+        self.assertEqual(len(calls), 2)
+        group0_keys = calls[0].args[0]
+        group1_keys = calls[1].args[0]
+        self.assertTrue(all("@group:" not in key for key in group0_keys))
+        self.assertTrue(all("@group:1@cache_role:kv@cache_family:c4@" in key for key in group1_keys))
+        self.assertEqual(calls[0].args[1], [60] * len(group0_keys))
+        self.assertEqual(calls[1].args[1], [8] * len(group1_keys))
+
+    def test_multi_group_get_session_restores_every_group(self):
+        worker = self._make_multi_group_worker()
+        group0_key = make_layerwise_block_key("model", "6830", 0)
+        group1_key = make_layerwise_block_key(
+            "model",
+            "6830",
+            0,
+            kv_cache_group_id=1,
+            cache_role="kv",
+            cache_family="c4",
+        )
+        worker._mooncake_session_tracker.register_put_keys("r1", [(group0_key, 0), (group1_key, 0)])
+        worker._mooncake_session_tracker.commit_put_keys([group0_key, group1_key])
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=16,
+            block_ids_by_group=[[10], [20]],
+            block_hashes=[b"h0"],
+            load_spec=LoadSpec(0, 16, can_load=True),
+        )
+        worker.m_store.batch_get_start.return_value = [0, 0]
+
+        slots = worker._prepare_mooncake_multi_group_get_session(request)
+        worker._open_mooncake_multi_group_get_sessions(slots)
+
+        self.assertEqual(request.load_block_keys_by_group[0], [group0_key])
+        self.assertEqual(request.load_block_keys_by_group[1], [group1_key])
+        self.assertEqual(sorted(request.load_keys), sorted([group0_key, group1_key]))
+
+    def test_multi_group_save_commits_each_group_at_its_own_final_layer(self):
+        store = MagicMock()
+        store.batch_copy_put.return_value = [10]
+        store.batch_commit.return_value = [0]
+        save_finished = [threading.Event(), threading.Event()]
+        sync_events = [MagicMock(), MagicMock()]
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=[16, 16],
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=save_finished,
+            sync_save_events=sync_events,
+            group_builders=[MagicMock(), MagicMock()],
+            group_final_layer_ids=[0, 1],
+        )
+
+        def make_meta(group_id: int, layer_id: int):
+            return LayerRangeReqMeta(
+                req_ids=["r1"],
+                layer_id=layer_id,
+                block_ids=[1],
+                keys=[f"k{group_id}"],
+                all_buffers=[[1000]],
+                all_sizes=[[10]],
+                all_offsets=[[0]],
+            )
+
+        builders = thread.group_builders
+        assert builders is not None
+        builders[0].build_addrs.side_effect = lambda shared, layer: make_meta(0, layer)
+        builders[1].build_addrs.side_effect = lambda shared, layer: make_meta(1, layer)
+        thread.add_stored_request("r1")
+        thread.add_stored_request("r1")
+        thread.add_stored_request("r1")
+        thread.add_stored_request("r1")
+
+        for layer_id in range(2):
+            tasks = []
+            for group_id in range(2):
+                shared = SharedBlockData(
+                    block_ids_arr=np.asarray([1], dtype=np.int64),
+                    block_gvas_arr=None,
+                    req_ids=["r1"],
+                    is_last_chunks=[True],
+                    block_keys=[f"k{group_id}"],
+                )
+                tasks.append(
+                    LayerTransferTask(
+                        layer_id=layer_id,
+                        block_ranges=[LayerBlockRange(request=None, start_block=0, end_block=1)],
+                        shared_block_data=shared,
+                        group_id=group_id,
+                        layer_idx_in_group=layer_id,
+                        use_key_major_ranges=True,
+                    )
+                )
+            thread._handle_request(tasks)
+
+        store.batch_commit.assert_has_calls(
+            [
+                call(["k0"]),
+                call(["k1"]),
+            ]
+        )
+        self.assertIn("r1", thread.finished_requests)
 
 
 if __name__ == "__main__":
