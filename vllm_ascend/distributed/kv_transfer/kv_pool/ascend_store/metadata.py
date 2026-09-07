@@ -1006,6 +1006,10 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        save_block_keys_by_group: list[list[str | None]] | None = None,
+        save_key_block_offset_by_group: list[int] | None = None,
+        load_block_keys_by_group: list[list[str | None]] | None = None,
+        load_key_block_offset_by_group: list[int] | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -1047,6 +1051,14 @@ class ReqMeta:
         self.load_key_block_offset = load_key_block_offset
         self.load_last_block_key = load_last_block_key
         self.load_keys = [] if load_keys is None else list(load_keys)
+        self.save_block_keys_by_group = (
+            None if save_block_keys_by_group is None else [list(keys) for keys in save_block_keys_by_group]
+        )
+        self.save_key_block_offset_by_group = save_key_block_offset_by_group
+        self.load_block_keys_by_group = (
+            None if load_block_keys_by_group is None else [list(keys) for keys in load_block_keys_by_group]
+        )
+        self.load_key_block_offset_by_group = load_key_block_offset_by_group
 
     @property
     def block_ids(self) -> list[int]:
@@ -1066,6 +1078,10 @@ class ReqMeta:
     load_block_keys: list[str | None] = field(default_factory=list)
     load_key_block_offset: int = 0
     load_last_block_key: str | None = None
+    save_block_keys_by_group: list[list[str | None]] | None = None
+    save_key_block_offset_by_group: list[int] | None = None
+    load_block_keys_by_group: list[list[str | None]] | None = None
+    load_key_block_offset_by_group: list[int] | None = None
 
     block_ids_np: np.ndarray | None = None
     block_ids_by_group_np: list[np.ndarray] | None = None

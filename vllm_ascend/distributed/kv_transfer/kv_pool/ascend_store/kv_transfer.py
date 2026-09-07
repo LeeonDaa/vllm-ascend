@@ -352,7 +352,34 @@ class LayerBatchBuilder:
     def _request_block_keys(
         request: ReqMeta,
         is_save: bool,
+        group_id: int = 0,
     ) -> tuple[list[str | None], int, str | None]:
+        if is_save and request.save_block_keys_by_group is not None:
+            if group_id >= len(request.save_block_keys_by_group):
+                raise RuntimeError(
+                    f"ReqMeta save block keys do not cover group {group_id} "
+                    f"({len(request.save_block_keys_by_group)} groups)"
+                )
+            offset = (
+                request.save_key_block_offset_by_group[group_id]
+                if request.save_key_block_offset_by_group is not None
+                and group_id < len(request.save_key_block_offset_by_group)
+                else 0
+            )
+            return request.save_block_keys_by_group[group_id], offset, None
+        if not is_save and request.load_block_keys_by_group is not None:
+            if group_id >= len(request.load_block_keys_by_group):
+                raise RuntimeError(
+                    f"ReqMeta load block keys do not cover group {group_id} "
+                    f"({len(request.load_block_keys_by_group)} groups)"
+                )
+            offset = (
+                request.load_key_block_offset_by_group[group_id]
+                if request.load_key_block_offset_by_group is not None
+                and group_id < len(request.load_key_block_offset_by_group)
+                else 0
+            )
+            return request.load_block_keys_by_group[group_id], offset, None
         if is_save:
             return (
                 request.save_block_keys,
@@ -403,7 +430,7 @@ class LayerBatchBuilder:
                     f"[{block_range.start_block}, {block_range.end_block})"
                 )
 
-            request_keys, key_block_offset, last_block_key = self._request_block_keys(request, is_save)
+            request_keys, key_block_offset, last_block_key = self._request_block_keys(request, is_save, self.group_id)
             key_start = block_range.start_block - key_block_offset
             key_end = block_range.end_block - key_block_offset
             if key_start < 0 or key_end > len(request_keys):
