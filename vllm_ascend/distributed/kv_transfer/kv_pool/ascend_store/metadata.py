@@ -20,8 +20,19 @@ def make_layerwise_block_key(
     model_name: str,
     block_hash_or_tail: str,
     head_or_tp_rank: int,
+    group_id: int = 0,
+    num_groups: int = 1,
 ) -> str:
-    """Build the canonical one-object-per-block-and-saving-rank key."""
+    """Build the canonical one-object-per-group-block-and-saving-rank key.
+
+    Single-group models keep the historical ``model@hash@rank`` format.
+    Multi-group (hybrid) models include the group id
+    (``model@group_id@hash@rank``) so that DSV4 groups with different block
+    sizes and layer offsets never alias each other — mirroring the MemCache
+    multi-group key layout from #12147 / RFC #12234.
+    """
+    if num_groups > 1:
+        return f"{model_name}@{group_id}@{block_hash_or_tail}@{head_or_tp_rank}"
     return f"{model_name}@{block_hash_or_tail}@{head_or_tp_rank}"
 
 
@@ -955,6 +966,12 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        save_block_keys_by_group: list[list[str | None]] | None = None,
+        save_last_block_key_by_group: list[str | None] | None = None,
+        save_key_block_offset_by_group: list[int] | None = None,
+        load_block_keys_by_group: list[list[str | None]] | None = None,
+        load_last_block_key_by_group: list[str | None] | None = None,
+        load_key_block_offset_by_group: list[int] | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -996,6 +1013,24 @@ class ReqMeta:
         self.load_key_block_offset = load_key_block_offset
         self.load_last_block_key = load_last_block_key
         self.load_keys = [] if load_keys is None else list(load_keys)
+        self.save_block_keys_by_group = (
+            [] if save_block_keys_by_group is None else [list(keys) for keys in save_block_keys_by_group]
+        )
+        self.save_last_block_key_by_group = (
+            [] if save_last_block_key_by_group is None else list(save_last_block_key_by_group)
+        )
+        self.save_key_block_offset_by_group = (
+            [] if save_key_block_offset_by_group is None else list(save_key_block_offset_by_group)
+        )
+        self.load_block_keys_by_group = (
+            [] if load_block_keys_by_group is None else [list(keys) for keys in load_block_keys_by_group]
+        )
+        self.load_last_block_key_by_group = (
+            [] if load_last_block_key_by_group is None else list(load_last_block_key_by_group)
+        )
+        self.load_key_block_offset_by_group = (
+            [] if load_key_block_offset_by_group is None else list(load_key_block_offset_by_group)
+        )
 
     @property
     def block_ids(self) -> list[int]:
@@ -1015,6 +1050,12 @@ class ReqMeta:
     load_block_keys: list[str | None] = field(default_factory=list)
     load_key_block_offset: int = 0
     load_last_block_key: str | None = None
+    save_block_keys_by_group: list[list[str | None]] = field(default_factory=list)
+    save_last_block_key_by_group: list[str | None] = field(default_factory=list)
+    save_key_block_offset_by_group: list[int] = field(default_factory=list)
+    load_block_keys_by_group: list[list[str | None]] = field(default_factory=list)
+    load_last_block_key_by_group: list[str | None] = field(default_factory=list)
+    load_key_block_offset_by_group: list[int] = field(default_factory=list)
 
     block_ids_np: np.ndarray | None = None
     block_ids_by_group_np: list[np.ndarray] | None = None
@@ -1175,6 +1216,7 @@ class LayerRangeReqMeta:
     all_buffers: list[list[int]]
     all_sizes: list[list[int]]
     all_offsets: list[list[int]]
+    is_last_chunks: list[bool | None] = field(default_factory=list)
     load_keys: list[str] = field(default_factory=list)
 
 

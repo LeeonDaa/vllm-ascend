@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import re
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -178,7 +179,10 @@ class KVPoolWorker:
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
         self.use_hybrid = uses_hybrid_kv_cache(vllm_config.scheduler_config, kv_cache_groups)
         if self.backend_name == "mooncake" and self.use_layerwise and self.use_hybrid:
-            raise ValueError("Mooncake layerwise does not yet support hybrid or multi-group KV cache layouts")
+            logger.warning(
+                "Mooncake range-session layerwise hybrid/multi-group KV is enabled (V2, experimental). "
+                "Object keys, sessions and hit checks are split per KV cache group."
+            )
         self.use_mamba = self._uses_mamba_kv_cache(self.use_hybrid, kv_cache_config)
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
@@ -1093,7 +1097,12 @@ class KVPoolWorker:
                 # chunked-prefill steps.  A later chunk can therefore have no
                 # new load_spec while still needing to restore the previously
                 # committed prefix into its newly allocated local blocks.
-                populated_slots = [index for index, key in enumerate(request.load_block_keys) if key is not None]
+                group_load_keys = (
+                    request.load_block_keys_by_group[group_id]
+                    if group_id < len(request.load_block_keys_by_group) and request.load_block_keys_by_group[group_id]
+                    else request.load_block_keys
+                )
+                populated_slots = [index for index, key in enumerate(group_load_keys) if key is not None]
                 if not populated_slots:
                     continue
                 request_block_ranges.append(
@@ -1616,8 +1625,8 @@ class KVPoolWorker:
             )
         return results
 
-    def _mooncake_object_size_bytes(self) -> int:
-        group_block_len = getattr(self, "group_block_len", {}).get(0, [])
+    def _mooncake_object_size_bytes(self, group_id: int = 0) -> int:
+        group_block_len = getattr(self, "group_block_len", {}).get(group_id, [])
         object_size = sum(group_block_len) if group_block_len else self.page_size_bytes
         if object_size <= 0:
             raise RuntimeError(f"Mooncake layerwise object size must be positive, got {object_size}")
@@ -1669,129 +1678,255 @@ class KVPoolWorker:
         self._current_mooncake_last_chunk_req_ids.difference_update(req_ids)
 
     def _prepare_mooncake_put_session(self, request: ReqMeta) -> None:
-        request.save_block_keys = []
-        request.save_last_block_key = None
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(self.grouped_block_size)
+        request.save_block_keys_by_group = [[] for _ in range(num_groups)]
+        request.save_last_block_key_by_group = [None] * num_groups
+        request.save_key_block_offset_by_group = [0] * num_groups
         if not self._is_layerwise_save_owner() or not request.can_save:
             return
-
-        start_block = request.save_start_token // self.block_size
-        end_block = request.save_end_token // self.block_size
-        if request.load_spec is not None and request.load_spec.can_load:
-            pool_hit_tokens = (
-                request.load_spec.kvpool_store_skip_tokens
-                if request.load_spec.kvpool_store_skip_tokens is not None
-                else request.load_spec.kvpool_cached_tokens
+        for group_id in range(num_groups):
+            group_block_size = get_group_block_size(self.grouped_block_size, group_id)
+            start_block = request.save_start_token // group_block_size
+            end_block = request.save_end_token // group_block_size
+            if request.load_spec is not None and request.load_spec.can_load:
+                pool_hit_tokens = (
+                    request.load_spec.kvpool_store_skip_tokens
+                    if request.load_spec.kvpool_store_skip_tokens is not None
+                    else request.load_spec.kvpool_cached_tokens
+                )
+                start_block = max(start_block, pool_hit_tokens // group_block_size)
+            group_block_hashes = get_block_hashes(
+                request.block_hashes,
+                group_block_size,
+                self.hash_block_size,
             )
-            start_block = max(start_block, pool_hit_tokens // self.block_size)
-        group_block_hashes = get_block_hashes(request.block_hashes, self.block_size, self.hash_block_size)
-        request.save_key_block_offset = start_block
-        request.save_block_keys = [None] * max(0, end_block - start_block)
-        key_slots: list[tuple[str, int | None, int]] = []
-        for block_index in range(start_block, min(end_block, len(group_block_hashes))):
-            key = make_layerwise_block_key(
-                self.model_name,
-                block_hash_to_str(group_block_hashes[block_index]),
-                self.head_or_tp_rank,
+            request.save_key_block_offset_by_group[group_id] = start_block
+            group_keys: list[str | None] = [None] * max(0, end_block - start_block)
+            request.save_block_keys_by_group[group_id] = group_keys
+            key_slots: list[tuple[str, int | None, int]] = []
+            for block_index in range(start_block, min(end_block, len(group_block_hashes))):
+                key = make_layerwise_block_key(
+                    self.model_name,
+                    block_hash_to_str(group_block_hashes[block_index]),
+                    self.head_or_tp_rank,
+                    group_id=group_id,
+                    num_groups=num_groups,
+                )
+                group_keys[block_index - start_block] = key
+                key_slots.append((key, block_index - start_block, block_index))
+
+            partial_index = request.partial_block_index
+            group_block_ids = self._request_group_block_ids(request, group_id)
+            if partial_index is not None and 0 <= partial_index < len(group_block_ids):
+                if num_groups > 1:
+                    partial_tag = f"{request.req_id}_lastblock_g{group_id}"
+                else:
+                    partial_tag = f"{request.req_id}_lastblock"
+                last_key = make_layerwise_block_key(
+                    self.model_name,
+                    partial_tag,
+                    self.head_or_tp_rank,
+                    group_id=group_id,
+                    num_groups=num_groups,
+                )
+                request.save_last_block_key_by_group[group_id] = last_key
+                key_slots.append((last_key, None, partial_index))
+
+            requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
+            if not requested_keys:
+                continue
+            with self._put_started_keys_lock:
+                previously_started = set(requested_keys) & self._put_started_keys
+                new_keys = [key for key in requested_keys if key not in self._put_started_keys]
+
+            started = set(previously_started)
+            if new_keys:
+                try:
+                    results = self._start_mooncake_put_keys(
+                        new_keys,
+                        self._mooncake_object_size_bytes(group_id),
+                    )
+                except Exception as exc:
+                    logger.error("Mooncake batch_put_start failed keys=%s error=%s", new_keys, exc)
+                    with self._put_started_keys_lock:
+                        self._put_started_keys.update(new_keys)
+                    self._queue_layerwise_revoke_keys(new_keys)
+                else:
+                    newly_started = {key for key, result in zip(new_keys, results, strict=True) if result == 0}
+                    with self._put_started_keys_lock:
+                        self._put_started_keys.update(newly_started)
+                    started.update(newly_started)
+
+            for key, slot, _ in key_slots:
+                if key in started:
+                    if slot is None:
+                        request.save_last_block_key_by_group[group_id] = key
+                elif slot is None:
+                    request.save_last_block_key_by_group[group_id] = None
+                else:
+                    group_keys[slot] = None
+            self._mooncake_session_tracker.register_put_keys(
+                request.req_id,
+                (
+                    (key, self._encode_mooncake_block_index(group_id, block_index))
+                    for key, _, block_index in key_slots
+                    if key in started
+                ),
             )
-            request.save_block_keys[block_index - start_block] = key
-            key_slots.append((key, block_index - start_block, block_index))
 
-        if request.partial_block_index is not None:
-            request.save_last_block_key = make_layerwise_block_key(
-                self.model_name,
-                f"{request.req_id}_lastblock",
-                self.head_or_tp_rank,
-            )
-            key_slots.append((request.save_last_block_key, None, request.partial_block_index))
+        # Single-group compatibility aliases used by the legacy code paths and
+        # existing unit tests.
+        if num_groups == 1:
+            request.save_block_keys = request.save_block_keys_by_group[0]
+            request.save_last_block_key = request.save_last_block_key_by_group[0]
+            request.save_key_block_offset = request.save_key_block_offset_by_group[0]
 
-        requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
-        if not requested_keys:
-            return
-        with self._put_started_keys_lock:
-            previously_started = set(requested_keys) & self._put_started_keys
-            new_keys = [key for key in requested_keys if key not in self._put_started_keys]
+    def _request_group_block_ids(self, request: ReqMeta, group_id: int) -> list[int]:
+        if request.block_ids_by_group_np is not None and group_id < len(request.block_ids_by_group_np):
+            return request.block_ids_by_group_np[group_id].tolist()
+        if group_id < len(request.block_ids_by_group):
+            return request.block_ids_by_group[group_id]
+        return request.block_ids
 
-        started = set(previously_started)
-        if new_keys:
-            try:
-                results = self._start_mooncake_put_keys(new_keys, self._mooncake_object_size_bytes())
-            except Exception as exc:
-                logger.error("Mooncake batch_put_start failed keys=%s error=%s", new_keys, exc)
-                with self._put_started_keys_lock:
-                    self._put_started_keys.update(new_keys)
-                self._queue_layerwise_revoke_keys(new_keys)
-            else:
-                newly_started = {key for key, result in zip(new_keys, results, strict=True) if result == 0}
-                with self._put_started_keys_lock:
-                    self._put_started_keys.update(newly_started)
-                started.update(newly_started)
+    def _mooncake_key_group_id(self, key: str) -> int:
+        """Recover the owning KV cache group from a Mooncake block key."""
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(getattr(self, "grouped_block_size", [1]))
+        if num_groups <= 1:
+            return 0
+        parts = key.split("@")
+        if len(parts) >= 3 and parts[1].isdigit():
+            return int(parts[1])
+        if len(parts) >= 3:
+            match = re.search(r"_g(\d+)$", parts[1])
+            if match:
+                return int(match.group(1))
+        return 0
 
-        for key, slot, _ in key_slots:
-            if key in started:
-                if slot is None:
-                    request.save_last_block_key = key
-            elif slot is None:
-                request.save_last_block_key = None
-            else:
-                request.save_block_keys[slot] = None
-        self._mooncake_session_tracker.register_put_keys(
-            request.req_id,
-            ((key, block_index) for key, _, block_index in key_slots if key in started),
-        )
+    def _encode_mooncake_block_index(self, group_id: int, block_index: int) -> int:
+        """Make tracker block slots unique across KV cache groups.
+
+        The MooncakeSessionTracker keys its per-request entries by block
+        index. DSV4 groups use different block sizes, so the same local block
+        index appears in every group and would otherwise evict sibling group
+        entries. Single-group deployments keep the raw index unchanged.
+        """
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(getattr(self, "grouped_block_size", [1]))
+        if num_groups <= 1:
+            return block_index
+        return group_id * (1 << 20) + block_index
+
+    def _decode_mooncake_block_index(self, encoded_index: int) -> tuple[int, int]:
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(getattr(self, "grouped_block_size", [1]))
+        if num_groups <= 1:
+            return 0, encoded_index
+        return encoded_index // (1 << 20), encoded_index % (1 << 20)
 
     def _prepare_mooncake_get_session(self, request: ReqMeta) -> list[tuple[str, int, int | None]]:
-        request.load_block_keys = []
-        request.load_last_block_key = None
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(self.grouped_block_size)
+        request.load_block_keys_by_group = [[] for _ in range(num_groups)]
+        request.load_last_block_key_by_group = [None] * num_groups
+        request.load_key_block_offset_by_group = [0] * num_groups
         request.load_keys = []
-        current_entries: list[tuple[str, int]] = []
+        current_entries: list[tuple[str, int, int]] = []
         load_spec = request.load_spec
         if load_spec is not None and load_spec.can_load:
             cached_tokens = load_spec.kvpool_cached_tokens
             if not self.use_eagle and load_spec.kvpool_store_skip_tokens is not None:
                 cached_tokens = load_spec.kvpool_store_skip_tokens
-            start_block = load_spec.vllm_cached_tokens // self.block_size
-            cached_full_blocks = cached_tokens // self.block_size
-            group_block_hashes = get_block_hashes(request.block_hashes, self.block_size, self.hash_block_size)
-            end_block = min(cached_full_blocks, len(group_block_hashes))
-            for block_index in range(start_block, end_block):
-                current_entries.append(
-                    (
-                        make_layerwise_block_key(
-                            self.model_name,
-                            block_hash_to_str(group_block_hashes[block_index]),
-                            self.head_or_tp_rank,
-                        ),
-                        block_index,
-                    )
+            for group_id in range(num_groups):
+                group_block_size = get_group_block_size(self.grouped_block_size, group_id)
+                group_block_ids = self._request_group_block_ids(request, group_id)
+                start_block = load_spec.vllm_cached_tokens // group_block_size
+                cached_full_blocks = cached_tokens // group_block_size
+                group_block_hashes = get_block_hashes(
+                    request.block_hashes,
+                    group_block_size,
+                    self.hash_block_size,
                 )
-            needs_last_block = cached_tokens % self.block_size != 0 or (
-                cached_tokens > 0 and end_block < cached_full_blocks
-            )
-            partial_block_index = cached_full_blocks if cached_tokens % self.block_size else cached_full_blocks - 1
-            if needs_last_block and 0 <= partial_block_index < len(request.block_ids):
-                current_entries.append(
-                    (
-                        make_layerwise_block_key(
-                            self.model_name,
-                            f"{request.req_id}_lastblock",
-                            self.head_or_tp_rank,
-                        ),
-                        partial_block_index,
+                end_block = min(cached_full_blocks, len(group_block_hashes))
+                for block_index in range(start_block, end_block):
+                    current_entries.append(
+                        (
+                            make_layerwise_block_key(
+                                self.model_name,
+                                block_hash_to_str(group_block_hashes[block_index]),
+                                self.head_or_tp_rank,
+                                group_id=group_id,
+                                num_groups=num_groups,
+                            ),
+                            group_id,
+                            block_index,
+                        )
                     )
+                needs_last_block = cached_tokens % group_block_size != 0 or (
+                    cached_tokens > 0 and end_block < cached_full_blocks
                 )
+                partial_block_index = cached_full_blocks if cached_tokens % group_block_size else cached_full_blocks - 1
+                if needs_last_block and 0 <= partial_block_index < len(group_block_ids):
+                    if num_groups > 1:
+                        partial_tag = f"{request.req_id}_lastblock_g{group_id}"
+                    else:
+                        partial_tag = f"{request.req_id}_lastblock"
+                    current_entries.append(
+                        (
+                            make_layerwise_block_key(
+                                self.model_name,
+                                partial_tag,
+                                self.head_or_tp_rank,
+                                group_id=group_id,
+                                num_groups=num_groups,
+                            ),
+                            group_id,
+                            partial_block_index,
+                        )
+                    )
 
-        load_entries = self._mooncake_session_tracker.prepare_load_entries(request.req_id, current_entries)
-        valid_entries = [
-            (key, block_index) for key, block_index in load_entries if 0 <= block_index < len(request.block_ids)
-        ]
-        if not valid_entries:
-            return []
-        request.load_key_block_offset = 0
-        request.load_block_keys = [None] * (max(block_index for _, block_index in valid_entries) + 1)
+        load_entries = self._mooncake_session_tracker.prepare_load_entries(
+            request.req_id,
+            (
+                (key, self._encode_mooncake_block_index(group_id, block_index))
+                for key, group_id, block_index in current_entries
+            ),
+        )
+        entries_by_group: list[list[tuple[str, int]]] = [[] for _ in range(num_groups)]
+        for key, encoded_index in load_entries:
+            group_id, block_index = self._decode_mooncake_block_index(encoded_index)
+            if group_id >= num_groups:
+                group_id = self._mooncake_key_group_id(key)
+            entries_by_group[group_id].append((key, block_index))
+
         key_slots: list[tuple[str, int, int | None]] = []
-        for key, block_index in valid_entries:
-            request.load_block_keys[block_index] = key
-            key_slots.append((key, request.block_ids[block_index], block_index))
+        for group_id in range(num_groups):
+            group_block_ids = self._request_group_block_ids(request, group_id)
+            valid_entries = [
+                (key, block_index)
+                for key, block_index in entries_by_group[group_id]
+                if 0 <= block_index < len(group_block_ids)
+            ]
+            if not valid_entries:
+                continue
+            request.load_key_block_offset_by_group[group_id] = 0
+            max_block = max(block_index for _, block_index in valid_entries)
+            group_keys: list[str | None] = [None] * (max_block + 1)
+            request.load_block_keys_by_group[group_id] = group_keys
+            for key, block_index in valid_entries:
+                group_keys[block_index] = key
+                key_slots.append((key, group_block_ids[block_index], block_index))
+
+        if num_groups == 1:
+            request.load_key_block_offset = request.load_key_block_offset_by_group[0]
+            request.load_block_keys = request.load_block_keys_by_group[0]
+            request.load_last_block_key = request.load_last_block_key_by_group[0]
         return key_slots
 
     def _open_mooncake_get_sessions(self, request_key_slots: list[tuple[ReqMeta, str, int, int | None]]) -> None:
@@ -1807,11 +1942,8 @@ class KVPoolWorker:
             logger.error("Mooncake batch_get_start failed keys=%s error=%s", keys, exc)
             self._release_failed_mooncake_get_attempts(request_ids_by_key)
             self._record_layerwise_invalid_blocks([block_id for _, _, block_id, _ in request_key_slots])
-            for request, _, _, slot in request_key_slots:
-                if slot is None:
-                    request.load_last_block_key = None
-                else:
-                    request.load_block_keys[slot] = None
+            for request, key, _, _ in request_key_slots:
+                self._clear_mooncake_load_key(request, key)
             return
 
         results_by_key = dict(zip(keys, results, strict=True))
@@ -1831,12 +1963,31 @@ class KVPoolWorker:
                     request_seen_keys[request_identity].add(key)
                 continue
             self._record_layerwise_invalid_blocks([block_id])
-            if slot is None:
-                request.load_last_block_key = None
-            else:
-                request.load_block_keys[slot] = None
+            self._clear_mooncake_load_key(request, key)
         for request_identity, request in requests_by_id.items():
             request.load_keys = request_load_keys[request_identity]
+
+    def _clear_mooncake_load_key(
+        self,
+        request: ReqMeta,
+        target_key: str,
+    ) -> None:
+        """Clear one failed get-session key from every per-group row set."""
+        for group_keys in request.load_block_keys_by_group:
+            for index, key in enumerate(group_keys):
+                if key == target_key:
+                    group_keys[index] = None
+                    break
+        if request.load_block_keys:
+            for index, key in enumerate(request.load_block_keys):
+                if key == target_key:
+                    request.load_block_keys[index] = None
+                    break
+        request.load_last_block_key_by_group = [
+            None if key == target_key else key for key in request.load_last_block_key_by_group
+        ]
+        if request.load_last_block_key == target_key:
+            request.load_last_block_key = None
 
     def _prepare_mooncake_layerwise_sessions(self, requests: list[ReqMeta]) -> None:
         self._layer_load_aborted.clear()

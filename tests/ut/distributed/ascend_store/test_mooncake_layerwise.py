@@ -160,6 +160,96 @@ class TestMooncakeLayerSaveSession(unittest.TestCase):
         self.assertEqual(tracker.prepare_load_entries("r1", []), [("key", 0)])
 
 
+class _FakeRangeBuilder:
+    def __init__(self, group_id: int, num_layers: int):
+        self.group_id = group_id
+        self.num_layers = num_layers
+
+    def build_addrs(self, shared, layer_idx_in_group):
+        del shared
+        return LayerRangeReqMeta(
+            req_ids=["r1"],
+            layer_id=layer_idx_in_group,
+            block_ids=[self.group_id],
+            keys=[f"key-g{self.group_id}"],
+            all_buffers=[[1000 + self.group_id]],
+            all_sizes=[[10]],
+            all_offsets=[[0]],
+            is_last_chunks=[True],
+        )
+
+
+class TestMooncakeRangeMultiGroupCommit(unittest.TestCase):
+    """Group sessions commit at each group's own final layer."""
+
+    def _make_thread(self):
+        store = MagicMock()
+        store.batch_copy_put.return_value = [10]
+        store.batch_commit.return_value = [0]
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            sync_save_events=[MagicMock(), MagicMock()],
+            group_builders=[
+                _FakeRangeBuilder(0, num_layers=1),
+                _FakeRangeBuilder(1, num_layers=2),
+            ],
+        )
+        return store, thread
+
+    def test_short_group_commits_before_global_final_layer(self):
+        store, thread = self._make_thread()
+        layer0_tasks = [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=0,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=1,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+        ]
+        thread.request_queue.put(layer0_tasks)
+        thread._handle_request(layer0_tasks)
+
+        # Group 0 has a single layer and is committed right away; group 1
+        # still has one more layer and must stay open.
+        store.batch_commit.assert_called_once_with(["key-g0"])
+
+        layer1_task = [
+            LayerTransferTask(
+                layer_id=1,
+                block_ranges=[],
+                group_id=1,
+                layer_idx_in_group=1,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            )
+        ]
+        thread.add_stored_request("r1")
+        thread.add_stored_request("r1")
+        thread.request_queue.put(layer1_task)
+        thread._handle_request(layer1_task)
+        self.assertEqual(store.batch_commit.call_args_list[1], ((["key-g1"],),))
+        self.assertTrue(thread.layer_save_finished_events[1].is_set())
+
+
 class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
     @staticmethod
     def _make_worker() -> KVPoolWorker:
@@ -266,6 +356,50 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         )
         self.assertIsNone(request.load_last_block_key)
         self.assertEqual(slots[-1], ("model@r1_lastblock@0", 11, 1))
+
+    def test_multigroup_put_start_splits_keys_and_object_sizes_per_group(self):
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.grouped_block_size = [32, 8]
+        worker.hash_block_size = 8
+        worker.block_size = 32
+        worker.group_block_len = {0: [64], 1: [16]}
+        worker.m_store.batch_put_start.side_effect = [[0], [0, 0, 0, 0]]
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            save_start_token=0,
+            save_end_token=32,
+            block_ids_by_group=[[5], [9, 10, 11, 12]],
+            block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+            can_save=True,
+        )
+
+        worker._prepare_mooncake_put_session(request)
+
+        # Group 0 has 32-token blocks -> one terminal hash key and 64-byte
+        # objects; group 1 has 8-token blocks -> four keys and 16-byte
+        # objects. Keys follow the MemCache multi-group layout
+        # (model@group_id@hash@rank).
+        self.assertEqual(request.save_block_keys_by_group[0], ["model@0@6833@0"])
+        self.assertEqual(
+            request.save_block_keys_by_group[1],
+            ["model@1@6830@0", "model@1@6831@0", "model@1@6832@0", "model@1@6833@0"],
+        )
+        calls = worker.m_store.batch_put_start.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].args, (["model@0@6833@0"], [64]))
+        self.assertEqual(
+            calls[1].args,
+            (
+                ["model@1@6830@0", "model@1@6831@0", "model@1@6832@0", "model@1@6833@0"],
+                [16, 16, 16, 16],
+            ),
+        )
+        all_keys = [key for group_keys in request.save_block_keys_by_group for key in group_keys if key is not None]
+        worker._mooncake_session_tracker.commit_put_keys(all_keys)
+        load_entries = worker._mooncake_session_tracker.prepare_load_entries("r1", [])
+        self.assertEqual(len(load_entries), 5)
 
 
 class TestMooncakeSessionTracker(unittest.TestCase):

@@ -119,6 +119,44 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(len(queried_keys), 3 * 2)
         self.assertEqual(queried_keys[:2], ["llama-7b@6830@0", "llama-7b@6830@1"])
 
+    def test_mooncake_layerwise_multigroup_hit_takes_min_over_groups(self):
+        scheduler = KVPoolScheduler(
+            self._make_config(extra_config={"backend": "mooncake", "use_layerwise": True}),
+            use_layerwise=True,
+        )
+        scheduler.kv_cache_group_ids = [0, 1]
+        scheduler.grouped_block_size = [16, 8]
+        scheduler.hash_block_size = 8
+        scheduler.use_hybrid = True
+        scheduler._block_size = 16
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1],
+            [1, 1, 1, 0],
+        ]
+        request = MagicMock(
+            request_id="r1",
+            block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+        )
+
+        hit_tokens = scheduler._get_mooncake_layerwise_hit_tokens(request, 32, 0)
+
+        # Group 0: two 16-token blocks complete -> 32 tokens.
+        # Group 1: only three of four 8-token blocks complete -> 24 tokens.
+        # The overall hit is bounded by group 1 (24 tokens).
+        self.assertEqual(hit_tokens, 24)
+        calls = scheduler.store_scheduler.batch_is_exist.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].args[0], ["llama-7b@0@6831@0", "llama-7b@0@6833@0"])
+        self.assertEqual(
+            calls[1].args[0],
+            [
+                "llama-7b@1@6830@0",
+                "llama-7b@1@6831@0",
+                "llama-7b@1@6832@0",
+                "llama-7b@1@6833@0",
+            ],
+        )
+
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_hit(self, mock_client_cls):
         request = MagicMock(

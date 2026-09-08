@@ -172,7 +172,7 @@ class KVPoolScheduler:
             self.use_layerwise,
         )
         if self.backend_name == "mooncake" and self.use_layerwise and self.use_hybrid:
-            raise ValueError("Mooncake layerwise does not yet support hybrid or multi-group KV cache layouts")
+            logger.warning("Mooncake range-session layerwise hybrid/multi-group KV is enabled (V2, experimental).")
         if self.backend_name == "mooncake" and self.use_layerwise and self.tp_mismatch:
             raise ValueError("Mooncake layerwise does not yet support prefill/decode TP mismatch")
         self.layerwise_max_transfer_blocks = int(
@@ -408,63 +408,83 @@ class KVPoolScheduler:
         token_len: int,
         num_computed_tokens: int,
     ) -> int:
+        """Multi-group block-object hit check for Mooncake range sessions.
+
+        Mirrors the MemCache GVA hit semantics (#12147): every KV cache group
+        keeps its own effective block size and object keys, and the overall
+        token-level hit is bounded by the group with the shortest prefix. A
+        Mooncake object exists only after its range session was committed, so
+        ``batch_is_exist`` is the completeness check.
+        """
         del num_computed_tokens
         num_hash_blocks = token_len // self.hash_block_size
-        block_hashes = get_block_hashes(
-            request.block_hashes[:num_hash_blocks],
-            self._block_size,
-            self.hash_block_size,
-        )
-        if not block_hashes:
-            return 0
+        raw_hashes = request.block_hashes[:num_hash_blocks]
         head_or_tp_ranks = self.tp_size // self.put_step
-        keys_by_block = [
-            [
-                make_layerwise_block_key(
-                    self.model_name,
-                    block_hash_to_str(block_hash),
-                    head_or_tp_rank,
-                )
-                for head_or_tp_rank in range(head_or_tp_ranks)
-            ]
-            for block_hash in block_hashes
-        ]
-        all_keys = [key for block_keys in keys_by_block for key in block_keys]
-        batch_size = (
-            self.layerwise_max_transfer_blocks * head_or_tp_ranks
-            if self.layerwise_max_transfer_blocks > 0
-            else max(1, len(all_keys))
-        )
-        batch_results: list[int] = []
-        for start in range(0, len(all_keys), batch_size):
-            key_batch = all_keys[start : start + batch_size]
-            results = self.store_scheduler.batch_is_exist(key_batch)
-            if len(results) != len(key_batch):
-                raise RuntimeError(
-                    "KV pool batch_is_exist returned unexpected number of results for "
-                    f"request {request.request_id}: expected={len(key_batch)}, actual={len(results)}"
-                )
-            batch_results.extend(int(result) for result in results)
-        if any(result not in (0, 1) for result in batch_results):
-            raise RuntimeError(
-                f"KV pool batch_is_exist failed for request {request.request_id}: states={batch_results}"
+        group_ids = self.kv_cache_group_ids if self.use_hybrid else [0]
+        num_groups = len(self.grouped_block_size)
+        hits_per_group: list[int] = []
+        for group_id in group_ids:
+            effective_block_size = get_group_block_size(self.grouped_block_size, group_id)
+            block_hashes = get_block_hashes(
+                raw_hashes,
+                effective_block_size,
+                self.hash_block_size,
             )
+            if not block_hashes:
+                hits_per_group.append(0)
+                continue
+            keys_by_block = [
+                [
+                    make_layerwise_block_key(
+                        self.model_name,
+                        block_hash_to_str(block_hash),
+                        head_or_tp_rank,
+                        group_id=group_id,
+                        num_groups=num_groups,
+                    )
+                    for head_or_tp_rank in range(head_or_tp_ranks)
+                ]
+                for block_hash in block_hashes
+            ]
+            all_keys = [key for block_keys in keys_by_block for key in block_keys]
+            batch_size = (
+                self.layerwise_max_transfer_blocks * head_or_tp_ranks
+                if self.layerwise_max_transfer_blocks > 0
+                else max(1, len(all_keys))
+            )
+            batch_results: list[int] = []
+            for start in range(0, len(all_keys), batch_size):
+                key_batch = all_keys[start : start + batch_size]
+                results = self.store_scheduler.batch_is_exist(key_batch)
+                if len(results) != len(key_batch):
+                    raise RuntimeError(
+                        "KV pool batch_is_exist returned unexpected number of results for "
+                        f"request {request.request_id} group {group_id}: "
+                        f"expected={len(key_batch)}, actual={len(results)}"
+                    )
+                batch_results.extend(int(result) for result in results)
+            if any(result not in (0, 1) for result in batch_results):
+                raise RuntimeError(
+                    f"KV pool batch_is_exist failed for request {request.request_id}: states={batch_results}"
+                )
 
-        num_hit_blocks = 0
-        offset = 0
-        for block_keys in keys_by_block:
-            block_results = batch_results[offset : offset + len(block_keys)]
-            offset += len(block_keys)
-            if not all(result == 1 for result in block_results):
-                break
-            num_hit_blocks += 1
+            num_hit_blocks = 0
+            offset = 0
+            for block_keys in keys_by_block:
+                block_results = batch_results[offset : offset + len(block_keys)]
+                offset += len(block_keys)
+                if not all(result == 1 for result in block_results):
+                    break
+                num_hit_blocks += 1
+            hits_per_group.append(num_hit_blocks * effective_block_size)
+        if not hits_per_group:
+            return 0
         logger.info(
-            "Mooncake layerwise hit check request=%s hit_blocks=%d/%d",
+            "Mooncake layerwise hit check request=%s hits_per_group=%s",
             request.request_id,
-            num_hit_blocks,
-            len(keys_by_block),
+            hits_per_group,
         )
-        return num_hit_blocks * self._block_size
+        return min(hits_per_group)
 
     def _get_block_key_layerwise_hit_tokens(
         self,
