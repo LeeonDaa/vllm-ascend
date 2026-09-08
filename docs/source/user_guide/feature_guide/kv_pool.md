@@ -30,9 +30,18 @@ When `MultiConnector` is used, configure `kv_load_failure_policy` on the `MultiC
 | `backend` | Set the storage backend for kvpool (`mooncake`, `memcache`, `yuanrong`), with the default being `mooncake`. |
 | `consumer_is_to_put` | Whether Decode node put KV Cache into KV Pool. The default value is false. |
 | `consumer_is_to_load` | Whether Decode node load KV cache from KV Pool. The default value is false. |
-| `use_layerwise` | Enable layer-by-layer KV save/load. Only supported on the Prefill node and requires the `memcache` backend. The default value is false. |
+| `use_layerwise` | Enable layer-by-layer KV save/load. Only supported on the Prefill node. The `memcache` backend uses GVA-based `batch_copy`; the `mooncake` backend uses per-layer key objects (single- and multi-group/hybrid models such as DeepSeek-V4-Flash are supported, currently experimental). The default value is false. |
 | `prefill_pp_size` | Prefill PP size, needs to be set when Prefill node enables PP. |
 | `prefill_pp_layer_partition` | Prefill PP layer partition, needs to be set when Prefill node enables PP. |
+
+> **Layerwise with the Mooncake backend**: layer-by-layer transfer stores one
+> object per (KV cache group, block, layer) and overlaps per-layer
+> save/load with attention computation. For hybrid models with several KV
+> cache groups (e.g. DeepSeek-V4-Flash), each group keeps its own effective
+> block size and layer count; a block is reported as cached only when every
+> layer object of every participating group exists. This mode requires
+> TP-only topology (PP/PCP/DCP = 1, no TP mismatch), and all Prefill, Decode,
+> and scheduler processes must run the same vllm-ascend version.
 
 ### Environment Variable Configuration
 
