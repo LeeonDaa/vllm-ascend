@@ -1837,6 +1837,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         layer_save_finished_events: list[threading.Event],
         sync_save_events: list[torch.npu.Event],
         num_layers: int,
+        num_kv_cache_groups: int = 1,
         h2d_stagger_us: int = 0,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
@@ -1872,6 +1873,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._load_abort_event = load_abort_event or threading.Event()
         self._active_load_indices: set[int] | None = None
         self._failed_load_keys: set[str] = set()
+        self.num_kv_cache_groups = num_kv_cache_groups
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
         if group_builders is not None:
             self.layer_batch_builder = group_builders[0]
@@ -1910,6 +1912,16 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self._invalid_block_ids.update(block_ids)
 
     def _mark_invalid_range_indices(self, req_meta: LayerRangeReqMeta, indices: list[int]) -> None:
+        if self.num_kv_cache_groups > 1:
+            # vLLM's per-block recompute path cannot consume per-group block
+            # ids on hybrid layouts (DSV4/Qwen3.5). Report at error level and
+            # let the caller keep the key out of the remaining layer gets.
+            logger.error(
+                "[KVPOOL_RANGE_DEBUG] hybrid load get failed keys=%s blocks=%s",
+                [req_meta.keys[index] for index in indices],
+                [req_meta.block_ids[index] for index in indices],
+            )
+            return
         with self._invalid_block_ids_lock:
             self._invalid_block_ids.update(req_meta.block_ids[index] for index in indices)
 

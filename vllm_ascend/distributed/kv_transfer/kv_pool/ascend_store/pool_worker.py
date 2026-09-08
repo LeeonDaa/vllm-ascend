@@ -569,9 +569,10 @@ class KVPoolWorker:
                     self.layer_save_finished_events,
                     self.sync_save_events,
                     self.num_layers,
-                    self.h2d_stagger_us,
-                    self.layerwise_max_transfer_blocks,
-                    self.layerwise_max_transfer_bytes,
+                    num_kv_cache_groups=self.num_kv_cache_groups,
+                    h2d_stagger_us=self.h2d_stagger_us,
+                    max_transfer_blocks=self.layerwise_max_transfer_blocks,
+                    max_transfer_bytes=self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
                     external_slot_release_waiter=self.external_slot_release_waiter,
                     save_failure_checker=(
@@ -1590,6 +1591,18 @@ class KVPoolWorker:
 
     def _record_layerwise_invalid_blocks(self, block_ids: list[int]) -> None:
         if not block_ids:
+            return
+        if (
+            self.backend_name == "mooncake"
+            and self.use_block_key_layerwise
+            and getattr(self, "num_kv_cache_groups", 1) > 1
+        ):
+            logger.error(
+                "[KVPOOL_RANGE_DEBUG] hybrid get-session open failed for %d blocks; "
+                "skipping per-group invalid-block recompute (vLLM recompute cannot "
+                "consume hybrid group ids)",
+                len(block_ids),
+            )
             return
         with self._invalid_block_ids_lock:
             self._invalid_block_ids.update(block_ids)
