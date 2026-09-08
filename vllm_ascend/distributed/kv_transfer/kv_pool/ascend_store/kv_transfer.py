@@ -1908,20 +1908,28 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 partial_index = block_range.partial_block_index
                 if partial_index is not None and 0 <= partial_index < len(request_block_ids):
                     block_ids.add(request_block_ids[partial_index])
+        if self.num_kv_cache_groups > 1:
+            logger.error(
+                "[KVPOOL_RANGE_DEBUG] hybrid layerwise transfer failed for blocks=%s; "
+                "whole-request abort (no per-group invalid-block recompute)",
+                sorted(block_ids),
+            )
+            return
         with self._invalid_block_ids_lock:
             self._invalid_block_ids.update(block_ids)
 
     def _mark_invalid_range_indices(self, req_meta: LayerRangeReqMeta, indices: list[int]) -> None:
         if self.num_kv_cache_groups > 1:
-            # vLLM's per-block recompute path cannot consume per-group block
-            # ids on hybrid layouts (DSV4/Qwen3.5). Report at error level and
-            # let the caller keep the key out of the remaining layer gets.
-            logger.error(
-                "[KVPOOL_RANGE_DEBUG] hybrid load get failed keys=%s blocks=%s",
-                [req_meta.keys[index] for index in indices],
-                [req_meta.block_ids[index] for index in indices],
+            # Mirror the MemCache multi-group semantics (#12147 / RFC #12234):
+            # hybrid layerwise loads cannot fall back to per-block
+            # recomputation, so fail the whole request instead of publishing
+            # per-group block ids that the vLLM scheduler cannot consume.
+            raise RuntimeError(
+                "Layerwise multi-group KV load failed and cannot safely fall "
+                "back to per-block recomputation: "
+                f"failed_keys={[req_meta.keys[index] for index in indices]} "
+                f"failed_blocks={[req_meta.block_ids[index] for index in indices]}"
             )
-            return
         with self._invalid_block_ids_lock:
             self._invalid_block_ids.update(req_meta.block_ids[index] for index in indices)
 

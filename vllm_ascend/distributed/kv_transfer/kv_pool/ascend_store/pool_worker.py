@@ -1597,13 +1597,11 @@ class KVPoolWorker:
             and self.use_block_key_layerwise
             and getattr(self, "num_kv_cache_groups", 1) > 1
         ):
-            logger.error(
-                "[KVPOOL_RANGE_DEBUG] hybrid get-session open failed for %d blocks; "
-                "skipping per-group invalid-block recompute (vLLM recompute cannot "
-                "consume hybrid group ids)",
-                len(block_ids),
+            raise RuntimeError(
+                "Layerwise multi-group KV load failed and cannot safely fall "
+                "back to per-block recomputation: "
+                f"failed_blocks={block_ids}"
             )
-            return
         with self._invalid_block_ids_lock:
             self._invalid_block_ids.update(block_ids)
 
@@ -1954,9 +1952,9 @@ class KVPoolWorker:
         except Exception as exc:
             logger.error("Mooncake batch_get_start failed keys=%s error=%s", keys, exc)
             self._release_failed_mooncake_get_attempts(request_ids_by_key)
-            self._record_layerwise_invalid_blocks([block_id for _, _, block_id, _ in request_key_slots])
             for request, key, _, _ in request_key_slots:
                 self._clear_mooncake_load_key(request, key)
+            self._record_layerwise_invalid_blocks([block_id for _, _, block_id, _ in request_key_slots])
             return
 
         results_by_key = dict(zip(keys, results, strict=True))
@@ -1965,6 +1963,7 @@ class KVPoolWorker:
         request_load_keys: dict[int, list[str]] = {}
         request_seen_keys: dict[int, set[str]] = {}
         requests_by_id: dict[int, ReqMeta] = {}
+        hybrid_failed_blocks: list[int] = []
         for request, key, block_id, slot in request_key_slots:
             request_identity = id(request)
             requests_by_id[request_identity] = request
@@ -1975,10 +1974,20 @@ class KVPoolWorker:
                     request_load_keys[request_identity].append(key)
                     request_seen_keys[request_identity].add(key)
                 continue
+            if self.num_kv_cache_groups > 1:
+                hybrid_failed_blocks.append(block_id)
+                continue
             self._record_layerwise_invalid_blocks([block_id])
             self._clear_mooncake_load_key(request, key)
         for request_identity, request in requests_by_id.items():
             request.load_keys = request_load_keys[request_identity]
+        if hybrid_failed_blocks:
+            self._end_mooncake_load_keys(keys)
+            raise RuntimeError(
+                "Layerwise multi-group KV load failed and cannot safely fall "
+                "back to per-block recomputation: "
+                f"failed_blocks={hybrid_failed_blocks}"
+            )
 
     def _clear_mooncake_load_key(
         self,
