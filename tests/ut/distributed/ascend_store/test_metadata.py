@@ -367,6 +367,59 @@ class TestChunkedTokenDatabase(unittest.TestCase):
         self.assertEqual(addr[0], 1000 + 5 * 160)
         self.assertEqual(addr[1], 2000 + 5 * 320)
 
+    def test_prepare_value_layer_resolves_group_and_layer_offsets(self):
+        group_metadata = [
+            KeyMetadata("llama", 0, 0, 0, 0),
+            KeyMetadata("llama", 1, 0, 0, 0),
+        ]
+        db = ChunkedTokenDatabase(group_metadata, block_size=[32, 8], partitions=None, hash_block_size=8)
+        db.set_group_buffers(
+            {0: [1000, 2000, 3000], 1: [4000, 5000]},
+            {0: [320, 160, 320], 1: [80, 80]},
+            {0: [320, 160, 320], 1: [80, 80]},
+            group_cache_families={0: "c1", 1: "c2"},
+            group_num_layers={0: 2, 1: 2},
+            group_layer_cache_entry_offsets={0: [0, 2, 3], 1: [0, 1, 2]},
+        )
+
+        # Group 0, layer 0 covers two cache tensors whose addresses start at
+        # 1000/2000; group 0, layer 1 covers only the third tensor (3000).
+        addr0, size0, block0 = db.prepare_value_layer(
+            0,
+            32,
+            [7, 8],
+            layer_id=0,
+            kv_cache_group_id=0,
+        )
+        self.assertEqual(block0, 7)
+        self.assertEqual(addr0, [1000 + 7 * 320, 2000 + 7 * 160])
+        self.assertEqual(size0, [320, 160])
+
+        addr1, size1, block1 = db.prepare_value_layer(
+            32,
+            64,
+            [7, 8],
+            layer_id=1,
+            kv_cache_group_id=0,
+        )
+        self.assertEqual(block1, 8)
+        self.assertEqual(addr1, [3000 + 8 * 320])
+        self.assertEqual(size1, [320])
+
+        # Group 1 has its own block size (8 tokens/block): block index 3
+        # (block id 4) holds tokens 24..31, and layer 0 covers only its
+        # first cache tensor.
+        addr2, size2, block2 = db.prepare_value_layer(
+            24,
+            32,
+            [1, 2, 3, 4],
+            layer_id=0,
+            kv_cache_group_id=1,
+        )
+        self.assertEqual(block2, 4)
+        self.assertEqual(addr2, [4000 + 4 * 80])
+        self.assertEqual(size2, [80])
+
     def test_decode_adaptor_prefill_pp_no_partitions(self):
         key, addr, size = self.db.decode_adaptor_prefill_pp(["k1"], [[1, 2]], [[10, 20]])
         self.assertEqual(key, ["k1"])

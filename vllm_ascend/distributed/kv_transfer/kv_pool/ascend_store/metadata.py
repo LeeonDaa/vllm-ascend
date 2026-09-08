@@ -464,22 +464,51 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list, block_id
 
-    def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
-        group_block_size = self.get_block_size(0)
+    def prepare_value_layer(
+        self,
+        start: int,
+        end: int,
+        block_ids: list[int],
+        layer_id: int,
+        kv_cache_group_id: int = 0,
+        cache_role: str = "kv",
+    ):
+        """Resolve the (addr, size) list of one layer inside one KV group.
+
+        ``layer_id`` is the layer index within the group (0-based, in the same
+        order as the group's unique physical layers). Multi-group models keep
+        one object per (group, block, rank) and write each group layer at its
+        own byte range inside the object, so the group must be selected here
+        instead of defaulting to group 0.
+        """
+        group_block_size = self.get_block_size(kv_cache_group_id)
         block_idx = start // group_block_size
         if block_idx >= len(block_ids):
             return [], [], 0
         block_id = block_ids[block_idx]
         addr_list: list[int] = []
         size_list: list[int] = []
-        group_addrs, group_block_len, group_block_stride = self._get_group_buffers(0)
-        num_layers = self.group_num_layers.get("kv", {}).get(0, 1)
-        entries_per_layer = len(group_addrs) // num_layers if num_layers else 0
-        if layer_id >= num_layers or entries_per_layer == 0:
-            return [], [], 0
-        start_idx = layer_id * entries_per_layer
-        for i in range(entries_per_layer):
-            idx = start_idx + i
+        group_addrs, group_block_len, group_block_stride = self._get_group_buffers(
+            kv_cache_group_id,
+            cache_role,
+        )
+        if not group_addrs:
+            return addr_list, size_list, block_id
+
+        # Prefer the per-group layer offset table (accounts for layers that
+        # store a different number of cache tensors). Fall back to the uniform
+        # layout used by single-group key-based layerwise transfer.
+        group_layer_offsets = self.group_layer_cache_entry_offsets.get(kv_cache_group_id)
+        if group_layer_offsets and layer_id < len(group_layer_offsets) - 1:
+            entry_indices = range(group_layer_offsets[layer_id], group_layer_offsets[layer_id + 1])
+        else:
+            num_layers = self.group_num_layers.get(cache_role, {}).get(kv_cache_group_id, 1)
+            entries_per_layer = len(group_addrs) // num_layers if num_layers else 0
+            if layer_id >= num_layers or entries_per_layer == 0:
+                return [], [], 0
+            entry_indices = range(layer_id * entries_per_layer, (layer_id + 1) * entries_per_layer)
+
+        for idx in entry_indices:
             block_stride = group_block_stride[idx] if group_block_stride else group_block_len[idx]
             addr = group_addrs[idx] + block_id * block_stride
             size = int(group_block_len[idx] / group_block_size * (end - start))

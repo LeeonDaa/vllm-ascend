@@ -31,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     build_layerwise_reuse_layout,
     get_gva_layerwise_config,
     get_layerwise_kv_cache_specs,
+    get_layerwise_physical_layer_index,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
@@ -227,9 +228,11 @@ class KVPoolScheduler:
         block_hashes,
         include_layers: bool = False,
         kv_cache_group_id: int = 0,
+        num_layers: int | None = None,
     ) -> list[list[str]]:
         head_or_tp_ranks = self.tp_size // self.put_step
         cache_family = get_group_cache_family(self.kv_cache_group_families, kv_cache_group_id)
+        layer_count = self.num_layers if num_layers is None else num_layers
         keys_by_block = []
         for block_hash in block_hashes:
             block_keys: list[str] = []
@@ -253,12 +256,107 @@ class KVPoolScheduler:
                             )
                             if include_layers:
                                 block_keys.extend(
-                                    layer_key.to_string() for layer_key in pool_key.split_layers(self.num_layers)
+                                    layer_key.to_string() for layer_key in pool_key.split_layers(layer_count)
                                 )
                             else:
                                 block_keys.append(pool_key.to_string())
             keys_by_block.append(block_keys)
         return keys_by_block
+
+    def _get_key_layerwise_group_layer_count(self, group_id: int) -> int:
+        """Number of per-layer objects the worker stores per (group, block).
+
+        The Key-based layerwise path stores one object per (group, layer,
+        block). Multi-group models write one object for every unique physical
+        layer covered by the group, so the scheduler hit check must query the
+        same layer count per group instead of the global model layer count.
+        Single-group models keep the legacy whole-model layer count.
+        """
+        if self.kv_cache_config is None or group_id >= len(self.kv_cache_config.kv_cache_groups):
+            return self.num_layers
+        group_spec = self.kv_cache_config.kv_cache_groups[group_id]
+        base_layers = getattr(self.hf_config, "num_hidden_layers", self.num_layers)
+        physical_layers = {
+            get_layerwise_physical_layer_index(layer_name, base_layers) for layer_name in group_spec.layer_names
+        }
+        effective_num_layers = self.num_layers
+        if physical_layers:
+            effective_num_layers = max(effective_num_layers, max(physical_layers) + 1)
+        return len([layer for layer in physical_layers if layer < effective_num_layers])
+
+    def _get_key_layerwise_hit_tokens(
+        self,
+        request: "Request",
+        token_len: int,
+        num_computed_tokens: int,
+    ) -> int:
+        """Multi-group hit check for the Key-based (Mooncake) layerwise path.
+
+        Every KV cache group is checked independently with its own effective
+        block size and per-layer object set; a block of a group is a hit only
+        when every layer object of that group exists. The overall token-level
+        hit is bounded by the group with the shortest hit prefix, mirroring
+        the GVA path's min-over-groups semantics (see #12147).
+        """
+        hits_per_group: list[int] = []
+        group_ids = self.kv_cache_group_ids if self.use_hybrid else [0]
+        for group_id in group_ids:
+            effective_block_size = get_group_block_size(self.grouped_block_size, group_id)
+            layer_count = self._get_key_layerwise_group_layer_count(group_id)
+            # In layerwise mode, always query from block 0 because the remote
+            # pool stores per-layer data that may not match local prefix cache.
+            query_start_block = 0
+            num_blocks = token_len // effective_block_size
+            block_hashes_to_query = request.block_hashes[query_start_block:num_blocks]
+            if not block_hashes_to_query:
+                continue
+
+            query_keys_by_block = self._generate_store_query_keys(
+                block_hashes_to_query,
+                include_layers=True,
+                kv_cache_group_id=group_id,
+                num_layers=layer_count,
+            )
+            query_keys = [key for block_keys in query_keys_by_block for key in block_keys]
+            exists_states = self.store_scheduler.batch_is_exist(query_keys)
+            if len(exists_states) != len(query_keys):
+                raise RuntimeError(
+                    "KV pool exists check returned unexpected number of "
+                    f"states for request {request.request_id} group {group_id}: "
+                    f"expected={len(query_keys)}, actual={len(exists_states)}"
+                )
+
+            num_queried_hit_blocks = 0
+            offset = 0
+            for block_keys in query_keys_by_block:
+                block_states = exists_states[offset : offset + len(block_keys)]
+                offset += len(block_keys)
+                if all(exists == 1 for exists in block_states):
+                    num_queried_hit_blocks += 1
+                    continue
+                if any(exists == 0 for exists in block_states):
+                    break
+                raise RuntimeError(
+                    f"KV pool exists check failed for request {request.request_id}: states={exists_states}"
+                )
+            hits_per_group.append((query_start_block + num_queried_hit_blocks) * effective_block_size)
+
+        if not hits_per_group:
+            logger.debug(
+                "hit_check: req=%s token_len=%d no participating groups (all skipped)",
+                request.request_id,
+                token_len,
+            )
+            return 0
+        hit_tokens = min(hits_per_group)
+        logger.debug(
+            "hit_check: req=%s token_len=%d hits_per_group=%s hit_tokens=%d",
+            request.request_id,
+            token_len,
+            hits_per_group,
+            hit_tokens,
+        )
+        return hit_tokens
 
     def _get_store_lookup_hit_tokens(
         self,
@@ -477,9 +575,17 @@ class KVPoolScheduler:
                 return 0, False
 
             if self.use_layerwise:
-                num_external_hit_tokens = self._get_store_lookup_hit_tokens(
-                    request, token_len, num_computed_tokens, include_layers=True
-                )
+                multi_group = self.kv_cache_config is not None and len(self.kv_cache_config.kv_cache_groups) > 1
+                if multi_group:
+                    num_external_hit_tokens = self._get_key_layerwise_hit_tokens(
+                        request,
+                        token_len,
+                        num_computed_tokens,
+                    )
+                else:
+                    num_external_hit_tokens = self._get_store_lookup_hit_tokens(
+                        request, token_len, num_computed_tokens, include_layers=True
+                    )
             else:
                 if num_computed_tokens >= token_len:
                     return 0, False

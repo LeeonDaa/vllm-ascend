@@ -1555,18 +1555,27 @@ class KVPoolWorker:
             if last_task is not None:
                 last_task.write_finish_keys.extend(dict.fromkeys(all_save_keys))
         elif isinstance(self.kv_send_thread, KVCacheStoreKeyLayerSendingThread):
-            first_task = None
-            for layer_id in range(self.num_layers):
-                if self.layer_save_tasks[layer_id]:
-                    first_task = self.layer_save_tasks[layer_id][0]
-                    break
-            if first_task is None:
-                return
-            cached = self.kv_send_thread.build_cached_process_tokens(first_task)
-            if cached is not None:
+            # The Key path pre-computes process_tokens once per KV cache
+            # group. Every group has its own effective block size and layer
+            # count in multi-group (hybrid) models, so the cache is attached
+            # only to tasks of the same group.
+            for group_id in range(self.num_kv_cache_groups):
+                first_task = None
                 for layer_id in range(self.num_layers):
                     for task in self.layer_save_tasks[layer_id]:
-                        task.cached_process_tokens = cached
+                        if task.group_id == group_id:
+                            first_task = task
+                            break
+                    if first_task is not None:
+                        break
+                if first_task is None:
+                    continue
+                cached = self.kv_send_thread.build_cached_process_tokens(first_task)
+                if cached is not None:
+                    for layer_id in range(self.num_layers):
+                        for task in self.layer_save_tasks[layer_id]:
+                            if task.group_id == group_id:
+                                task.cached_process_tokens = cached
 
     def _build_shared_load_data(self) -> None:
         """Build shared block data once and attach to all layer load tasks.

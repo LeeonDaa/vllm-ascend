@@ -821,6 +821,100 @@ class TestKVPoolSchedulerGetLayerwiseGvaHitTokens(unittest.TestCase):
                 self.assertEqual(result, expected)
 
 
+class TestKVPoolSchedulerKeyLayerwiseHitTokens(unittest.TestCase):
+    """Multi-group hit check for the Key-based (Mooncake) layerwise path."""
+
+    @staticmethod
+    def _make_group(layer_names):
+        group = MagicMock()
+        group.layer_names = layer_names
+        return group
+
+    def _make_scheduler(self):
+        scheduler = KVPoolScheduler(make_config(extra_config={"backend": "mooncake"}), use_layerwise=False)
+        scheduler.kv_cache_config = MagicMock()
+        scheduler.kv_cache_config.kv_cache_groups = [
+            self._make_group(["model.layers.0.self_attn", "model.layers.1.self_attn"]),
+            self._make_group(["model.layers.0.self_attn"]),
+        ]
+        scheduler.use_hybrid = True
+        scheduler.kv_cache_group_ids = [0, 1]
+        scheduler.kv_cache_group_families = ["c1", "c2"]
+        scheduler.grouped_block_size = [16, 8]
+        scheduler.hash_block_size = 8
+        scheduler.num_layers = 2
+        scheduler.hf_config = MagicMock()
+        scheduler.hf_config.num_hidden_layers = 2
+        scheduler.tp_size = 1
+        scheduler.put_step = 1
+        scheduler.pcp_size = 1
+        scheduler.dcp_size = 1
+        scheduler.pp_rank = 0
+        return scheduler
+
+    def test_group_layer_count_resolves_from_kv_cache_groups(self):
+        scheduler = self._make_scheduler()
+        self.assertEqual(scheduler._get_key_layerwise_group_layer_count(0), 2)
+        self.assertEqual(scheduler._get_key_layerwise_group_layer_count(1), 1)
+
+    def test_hit_tokens_take_min_across_groups(self):
+        scheduler = self._make_scheduler()
+        request = MagicMock()
+        request.request_id = "r1"
+        request.block_hashes = [b"\xaa"] * 4
+
+        # Group 0: two 16-token blocks x 2 layers = 4 keys, all present.
+        # Group 1: four 8-token blocks x 1 layer = 4 keys, only the first two
+        # present -> the overall hit is bounded to 16 tokens by group 1.
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1, 1, 1],
+            [1, 1, 0, 0],
+        ]
+        result = scheduler._get_key_layerwise_hit_tokens(request, 32, 0)
+        self.assertEqual(result, 16)
+
+        # Both groups fully present -> the whole 32-token prefix is a hit.
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+        ]
+        result = scheduler._get_key_layerwise_hit_tokens(request, 32, 0)
+        self.assertEqual(result, 32)
+
+        # Group 0 misses at its second block; group 1 is complete. The hit is
+        # still bounded by group 0's 16-token prefix.
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1, 0, 0],
+            [1, 1, 1, 1],
+        ]
+        result = scheduler._get_key_layerwise_hit_tokens(request, 32, 0)
+        self.assertEqual(result, 16)
+
+    def test_hit_keys_are_group_and_layer_aware(self):
+        scheduler = self._make_scheduler()
+        request = MagicMock()
+        request.request_id = "r1"
+        request.block_hashes = [b"h0", b"h1", b"h2", b"h3"]
+        scheduler.store_scheduler.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+
+        result = scheduler._get_key_layerwise_hit_tokens(request, 32, 0)
+        self.assertEqual(result, 32)
+
+        calls = scheduler.store_scheduler.batch_is_exist.call_args_list
+        self.assertEqual(len(calls), 2)
+        group0_keys = [key for key in calls[0].args[0] if "@group:0" in key]
+        group1_keys = [key for key in calls[1].args[0] if "@group:1" in key]
+        self.assertEqual(len(calls[0].args[0]) + len(calls[1].args[0]), 8)
+        # Group 0 stores two layers per 16-token block (2 blocks x 2 layers).
+        self.assertEqual(len(group0_keys), 4)
+        self.assertTrue(all("@layer_id:0" in key or "@layer_id:1" in key for key in group0_keys))
+        # Group 1 stores one layer per 8-token block (4 blocks x 1 layer).
+        self.assertEqual(len(group1_keys), 4)
+        self.assertTrue(all("@layer_id:0" in key for key in group1_keys))
+        self.assertIn("@cache_family:c1", group0_keys[0])
+        self.assertIn("@cache_family:c2", group1_keys[0])
+
+
 class TestKVPoolSchedulerUpdateStateAfterAllocBranches(unittest.TestCase):
     """Test update_state_after_alloc additional branches."""
 
