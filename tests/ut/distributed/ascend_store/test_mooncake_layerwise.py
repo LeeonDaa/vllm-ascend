@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreLayerSendingThread,
+    KVCacheStoreLayerRecvingThread,
     KVTransferThread,
     LayerBatchBuilder,
     _build_range_debug_payload,
@@ -31,6 +32,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ChunkedTokenDatabase,
     KeyMetadata,
     LayerBlockRange,
+    LayerLoadTask,
     LayerRangeReqMeta,
     LayerTransferTask,
     LoadSpec,
@@ -248,6 +250,116 @@ class TestMooncakeRangeMultiGroupCommit(unittest.TestCase):
         thread._handle_request(layer1_task)
         self.assertEqual(store.batch_commit.call_args_list[1], ((["key-g1"],),))
         self.assertTrue(thread.layer_save_finished_events[1].is_set())
+
+
+class TestMooncakeRangeMultiGroupBatchedTransfer(unittest.TestCase):
+    """Multi-group layerwise save/load batch one backend call per physical layer."""
+
+    def test_multi_group_save_batches_put_and_sync_per_layer(self):
+        store = MagicMock()
+        store.batch_copy_put.return_value = [10, 10]
+        store.batch_commit.return_value = [0]
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            sync_save_events=[MagicMock(), MagicMock()],
+            group_builders=[
+                _FakeRangeBuilder(0, num_layers=1),
+                _FakeRangeBuilder(1, num_layers=2),
+            ],
+            num_kv_cache_groups=2,
+        )
+        layer0_tasks = [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=0,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=1,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+        ]
+        thread.request_queue.put(layer0_tasks)
+        thread._handle_request(layer0_tasks)
+        # One batched put covering both groups, one per-layer stream sync, then
+        # the short group commits immediately while the longer group stays open.
+        self.assertEqual(store.batch_copy_put.call_count, 1)
+        self.assertEqual(thread.sync_save_events[0].synchronize.call_count, 1)
+        store.batch_commit.assert_called_once_with(["key-g0"])
+
+    def test_multi_group_load_batches_get_per_layer(self):
+        store = MagicMock()
+        store.batch_copy_get.return_value = [0, 0]
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[
+                threading.Event(),
+                threading.Event(),
+                threading.Event(),
+            ],
+            layer_save_finished_events=[
+                threading.Event(),
+                threading.Event(),
+                threading.Event(),
+            ],
+            sync_save_events=[MagicMock(), MagicMock(), MagicMock()],
+            num_layers=3,
+            num_kv_cache_groups=2,
+            group_builders=[
+                _FakeRangeBuilder(0, num_layers=1),
+                _FakeRangeBuilder(1, num_layers=2),
+            ],
+        )
+        data = LayerLoadTask(
+            wait_for_save_layer=None,
+            transfer_tasks=[
+                LayerTransferTask(
+                    layer_id=0,
+                    block_ranges=[],
+                    group_id=0,
+                    layer_idx_in_group=0,
+                    shared_block_data=MagicMock(),
+                    use_key_major_ranges=True,
+                ),
+                LayerTransferTask(
+                    layer_id=0,
+                    block_ranges=[],
+                    group_id=1,
+                    layer_idx_in_group=0,
+                    shared_block_data=MagicMock(),
+                    use_key_major_ranges=True,
+                ),
+            ],
+            layer_id=0,
+        )
+        thread.request_queue.put(data)
+        thread._handle_request(data)
+        # One batched get covering both groups per physical layer.
+        self.assertEqual(store.batch_copy_get.call_count, 1)
 
 
 class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
