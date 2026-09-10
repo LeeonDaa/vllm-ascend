@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import queue
@@ -1557,6 +1558,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         max_transfer_bytes: int = 0,
         group_builders: list[LayerBatchBuilder] | None = None,
         num_kv_cache_groups: int = 1,
+        transfer_stream: torch.npu.Stream | None = None,
         put_started_keys: set[str] | None = None,
         put_started_keys_lock: threading.Lock | None = None,
         session_tracker: MooncakeSessionTracker | None = None,
@@ -1583,6 +1585,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self._active_put_keys: set[str] | None = None
         self._revoked_put_keys: set[str] = set()
         self.num_kv_cache_groups = num_kv_cache_groups
+        self.transfer_stream = transfer_stream
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
         if group_builders is not None:
             self.layer_batch_builder = group_builders[0]
@@ -1799,24 +1802,33 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 all_offsets.append(req_meta.all_offsets[index])
 
         if active_keys:
-            # One compute-stream sync per physical layer (was one per group per layer).
-            self.sync_save_events[layer_id].synchronize()
+            # One compute-stream event per physical layer (was one per group per
+            # layer). When a dedicated transfer stream is configured, the stream
+            # waits on the compute event at device level so the host never blocks
+            # and the put overlaps the next layer's compute.
+            if self.transfer_stream is not None:
+                self.transfer_stream.wait_event(self.sync_save_events[layer_id])
+                stream_ctx = torch.npu.stream(self.transfer_stream)
+            else:
+                self.sync_save_events[layer_id].synchronize()
+                stream_ctx = contextlib.nullcontext()
             results: list[int] = []
-            for keys, buffers, sizes, offsets in self._range_transfer_batches(
-                active_keys,
-                all_buffers,
-                all_sizes,
-                all_offsets,
-                self.max_transfer_blocks,
-                self.max_transfer_bytes,
-            ):
-                results.extend(
-                    require_aligned_batch_results(
-                        "batch_copy_put",
-                        keys,
-                        self.m_store.batch_copy_put(keys, buffers, sizes, offsets),
+            with stream_ctx:
+                for keys, buffers, sizes, offsets in self._range_transfer_batches(
+                    active_keys,
+                    all_buffers,
+                    all_sizes,
+                    all_offsets,
+                    self.max_transfer_blocks,
+                    self.max_transfer_bytes,
+                ):
+                    results.extend(
+                        require_aligned_batch_results(
+                            "batch_copy_put",
+                            keys,
+                            self.m_store.batch_copy_put(keys, buffers, sizes, offsets),
+                        )
                     )
-                )
             _emit_range_debug_event("save", layer_id, all_sizes, all_offsets, results)
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:
@@ -1940,6 +1952,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         sync_save_events: list[torch.npu.Event],
         num_layers: int,
         num_kv_cache_groups: int = 1,
+        transfer_stream: torch.npu.Stream | None = None,
+        load_done_events: list[torch.npu.Event] | None = None,
         h2d_stagger_us: int = 0,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
@@ -1976,6 +1990,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self._active_load_indices: set[int] | None = None
         self._failed_load_keys: set[str] = set()
         self.num_kv_cache_groups = num_kv_cache_groups
+        self.transfer_stream = transfer_stream
+        self.load_done_events = load_done_events
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
         if group_builders is not None:
             self.layer_batch_builder = group_builders[0]
@@ -2176,20 +2192,33 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         if active_keys:
             results: list[int] = []
-            for keys, buffers, sizes, offsets in self._range_transfer_batches(
-                active_keys,
-                all_buffers,
-                all_sizes,
-                all_offsets,
-                self.max_transfer_blocks,
-                self.max_transfer_bytes,
+            # A dedicated transfer stream lets this layer's H2D run concurrently
+            # with the compute stream instead of serializing behind it.
+            with (
+                torch.npu.stream(self.transfer_stream)
+                if self.transfer_stream is not None
+                else contextlib.nullcontext()
             ):
-                results.extend(
-                    require_aligned_batch_results(
-                        "batch_copy_get",
-                        keys,
-                        self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
+                for keys, buffers, sizes, offsets in self._range_transfer_batches(
+                    active_keys,
+                    all_buffers,
+                    all_sizes,
+                    all_offsets,
+                    self.max_transfer_blocks,
+                    self.max_transfer_bytes,
+                ):
+                    results.extend(
+                        require_aligned_batch_results(
+                            "batch_copy_get",
+                            keys,
+                            self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
+                        )
                     )
+            if self.load_done_events is not None:
+                # Publish completion on the transfer stream so the compute stream
+                # can device-wait for this layer's H2D without a host sync.
+                self.load_done_events[layer_id].record(
+                    self.transfer_stream if self.transfer_stream is not None else torch.npu.current_stream()
                 )
             _emit_range_debug_event("load", layer_id, all_sizes, all_offsets, results)
             failed_keys = {key for key, result in zip(active_keys, results, strict=True) if result < 0}

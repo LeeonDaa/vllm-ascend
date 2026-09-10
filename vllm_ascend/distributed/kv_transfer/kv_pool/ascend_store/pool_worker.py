@@ -209,6 +209,9 @@ class KVPoolWorker:
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
+        # Multi-group Mooncake range transfers run on a dedicated NPU stream so
+        # load/save overlaps compute. Set false to fall back to host-sync behavior.
+        self.layerwise_async_transfer = bool(extra_config.get("layerwise_async_transfer", True))
 
         logger.info(
             "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
@@ -507,11 +510,18 @@ class KVPoolWorker:
         if self._transfer_threads_started:
             return
 
+        # Dedicated stream for multi-group Mooncake range transfers so the
+        # per-layer load/save overlaps the compute stream instead of serializing.
+        self.layerwise_transfer_stream: torch.npu.Stream | None = None
+        self.layer_load_done_events: list[torch.npu.Event] | None = None
         if self.use_layerwise:
             self.get_event = threading.Event()
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
+            if self.use_block_key_layerwise and self.num_kv_cache_groups > 1 and self.layerwise_async_transfer:
+                self.layerwise_transfer_stream = torch.npu.Stream()
+                self.layer_load_done_events = [torch.npu.Event() for _ in range(self.num_layers)]
             can_save = is_kv_save_role(self.kv_role, self.consumer_is_to_put)
             if self.use_block_key_layerwise and can_save:
                 ready_event_sending = threading.Event()
@@ -531,6 +541,7 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
                     num_kv_cache_groups=self.num_kv_cache_groups,
+                    transfer_stream=self.layerwise_transfer_stream,
                     put_started_keys=self._put_started_keys,
                     put_started_keys_lock=self._put_started_keys_lock,
                     session_tracker=self._mooncake_session_tracker if self.backend_name == "mooncake" else None,
@@ -571,6 +582,8 @@ class KVPoolWorker:
                     self.sync_save_events,
                     self.num_layers,
                     num_kv_cache_groups=self.num_kv_cache_groups,
+                    transfer_stream=self.layerwise_transfer_stream,
+                    load_done_events=self.layer_load_done_events,
                     h2d_stagger_us=self.h2d_stagger_us,
                     max_transfer_blocks=self.layerwise_max_transfer_blocks,
                     max_transfer_bytes=self.layerwise_max_transfer_bytes,
@@ -2174,6 +2187,11 @@ class KVPoolWorker:
                     self.kv_recv_thread.raise_if_failed()
                     logger.info("Layerwise %d load not done, keep waiting", self.current_layer)
                 self.kv_recv_thread.raise_if_failed()
+                if self.layer_load_done_events is not None:
+                    # Device-level ordering: the compute stream proceeds only after
+                    # the transfer stream finished this layer's H2D, so the host
+                    # does not have to block on the copy itself.
+                    torch.npu.current_stream().wait_event(self.layer_load_done_events[self.current_layer])
             elif self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(self.current_layer)
         except Exception:

@@ -17,7 +17,7 @@
 
 import threading
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -360,6 +360,174 @@ class TestMooncakeRangeMultiGroupBatchedTransfer(unittest.TestCase):
         thread._handle_request(data)
         # One batched get covering both groups per physical layer.
         self.assertEqual(store.batch_copy_get.call_count, 1)
+
+    def test_multi_group_save_uses_transfer_stream_instead_of_host_sync(self):
+        store = MagicMock()
+        store.batch_copy_put.return_value = [10, 10]
+        store.batch_commit.return_value = [0]
+        transfer_stream = MagicMock()
+        sync_events = [MagicMock(), MagicMock()]
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            sync_save_events=sync_events,
+            group_builders=[
+                _FakeRangeBuilder(0, num_layers=1),
+                _FakeRangeBuilder(1, num_layers=2),
+            ],
+            num_kv_cache_groups=2,
+            transfer_stream=transfer_stream,
+        )
+        layer0_tasks = [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=0,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=1,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+        ]
+        thread.request_queue.put(layer0_tasks)
+        thread._handle_request(layer0_tasks)
+        # The transfer stream (device) waits on the compute event; the host no
+        # longer blocks on it, so the put can overlap with the next layer.
+        transfer_stream.wait_event.assert_called_once_with(sync_events[0])
+        sync_events[0].synchronize.assert_not_called()
+
+    def test_multi_group_load_runs_copy_on_transfer_stream(self):
+        store = MagicMock()
+        store.batch_copy_get.return_value = [0, 0]
+        transfer_stream = MagicMock()
+        entered: list[object] = []
+
+        class _StreamCtx:
+            def __init__(self, stream):
+                entered.append(stream)
+
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *exc):
+                return False
+
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[threading.Event()] * 3,
+            layer_save_finished_events=[threading.Event()] * 3,
+            sync_save_events=[MagicMock()] * 3,
+            num_layers=3,
+            num_kv_cache_groups=2,
+            group_builders=[
+                _FakeRangeBuilder(0, num_layers=1),
+                _FakeRangeBuilder(1, num_layers=2),
+            ],
+            transfer_stream=transfer_stream,
+        )
+        data = LayerLoadTask(
+            wait_for_save_layer=None,
+            transfer_tasks=[
+                LayerTransferTask(
+                    layer_id=0,
+                    block_ranges=[],
+                    group_id=0,
+                    layer_idx_in_group=0,
+                    shared_block_data=MagicMock(),
+                    use_key_major_ranges=True,
+                ),
+                LayerTransferTask(
+                    layer_id=0,
+                    block_ranges=[],
+                    group_id=1,
+                    layer_idx_in_group=0,
+                    shared_block_data=MagicMock(),
+                    use_key_major_ranges=True,
+                ),
+            ],
+            layer_id=0,
+        )
+        with patch("torch.npu.stream", lambda stream: _StreamCtx(stream)):
+            thread.request_queue.put(data)
+            thread._handle_request(data)
+        self.assertEqual(entered, [transfer_stream])
+        self.assertEqual(store.batch_copy_get.call_count, 1)
+
+    def test_multi_group_load_records_completion_event_on_transfer_stream(self):
+        store = MagicMock()
+        store.batch_copy_get.return_value = [0, 0]
+        transfer_stream = MagicMock()
+        load_done_events = [MagicMock(), MagicMock(), MagicMock()]
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[threading.Event()] * 3,
+            layer_save_finished_events=[threading.Event()] * 3,
+            sync_save_events=[MagicMock()] * 3,
+            num_layers=3,
+            num_kv_cache_groups=2,
+            group_builders=[
+                _FakeRangeBuilder(0, num_layers=1),
+                _FakeRangeBuilder(1, num_layers=2),
+            ],
+            transfer_stream=transfer_stream,
+            load_done_events=load_done_events,
+        )
+        data = LayerLoadTask(
+            wait_for_save_layer=None,
+            transfer_tasks=[
+                LayerTransferTask(
+                    layer_id=0,
+                    block_ranges=[],
+                    group_id=0,
+                    layer_idx_in_group=0,
+                    shared_block_data=MagicMock(),
+                    use_key_major_ranges=True,
+                ),
+                LayerTransferTask(
+                    layer_id=0,
+                    block_ranges=[],
+                    group_id=1,
+                    layer_idx_in_group=0,
+                    shared_block_data=MagicMock(),
+                    use_key_major_ranges=True,
+                ),
+            ],
+            layer_id=0,
+        )
+        thread.request_queue.put(data)
+        thread._handle_request(data)
+        load_done_events[0].record.assert_called_once_with(transfer_stream)
 
 
 class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
