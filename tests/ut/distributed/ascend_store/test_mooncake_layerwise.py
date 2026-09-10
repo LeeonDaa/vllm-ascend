@@ -440,7 +440,70 @@ class TestMooncakeRangeMultiGroupBatchedTransfer(unittest.TestCase):
         self.assertEqual(load_payloads[0]["keys_total"], 2)
         self.assertEqual(load_payloads[0]["fragments"], 2)
         self.assertEqual(load_payloads[0]["batches"], 1)
+        self.assertIn("prep_ms", load_payloads[0])
+        self.assertIn("stagger_ms", load_payloads[0])
+        copy_payloads = [p for p in payloads if p.get("event") == "load_copy"]
+        self.assertEqual(len(copy_payloads), 1)
+        self.assertEqual(len(copy_payloads[0]["batch_ms"]), 1)
         self.assertTrue(any(p.get("event") == "timing" for p in payloads))
+
+    def test_layer_diag_emits_save_detail_when_enabled(self):
+        store = MagicMock()
+        store.batch_copy_put.return_value = [10, 10]
+        store.batch_commit.return_value = [0]
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            sync_save_events=[MagicMock(), MagicMock()],
+            group_builders=[
+                _FakeRangeBuilder(0, num_layers=1),
+                _FakeRangeBuilder(1, num_layers=2),
+            ],
+            num_kv_cache_groups=2,
+        )
+        tasks = [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=0,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=1,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+        ]
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer._layer_diag_enabled",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer._emit_layer_diag"
+            ) as emit,
+        ):
+            thread.request_queue.put(tasks)
+            thread._handle_request(tasks)
+        events = [call.args[0] for call in emit.call_args_list]
+        detail = [p for p in events if p.get("event") == "save_detail"]
+        self.assertEqual(len(detail), 1)
+        self.assertIn("sync_ms", detail[0])
+        self.assertIn("put_ms", detail[0])
+        self.assertEqual(detail[0]["keys_total"], 2)
 
     def test_layer_diag_is_silent_when_disabled(self):
         thread = self._make_diag_thread()

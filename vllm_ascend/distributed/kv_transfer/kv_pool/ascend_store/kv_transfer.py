@@ -1837,6 +1837,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             _emit_layer_diag(
                 {
                     "event": "save",
+                    "ts": time.perf_counter(),
                     "layer_id": int(layer_id),
                     "keys_per_group": [len(req_meta.keys) for req_meta, _commit in metas],
                     "keys_total": len(active_keys),
@@ -1847,11 +1848,16 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     "max_transfer_bytes": int(self.max_transfer_bytes),
                 }
             )
+        save_sync_ms = 0.0
+        save_batch_ms: list[float] = []
         if active_keys:
             # One compute-stream sync per physical layer (was one per group per layer).
+            sync_start = time.perf_counter()
             self.sync_save_events[layer_id].synchronize()
+            save_sync_ms = round((time.perf_counter() - sync_start) * 1000, 3)
             results: list[int] = []
             for keys, buffers, sizes, offsets in diag_batches:
+                batch_start = time.perf_counter()
                 results.extend(
                     require_aligned_batch_results(
                         "batch_copy_put",
@@ -1859,12 +1865,24 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         self.m_store.batch_copy_put(keys, buffers, sizes, offsets),
                     )
                 )
+                save_batch_ms.append(round((time.perf_counter() - batch_start) * 1000, 3))
             _emit_range_debug_event("save", layer_id, all_sizes, all_offsets, results)
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:
                 self._revoke_range_keys(failed_keys)
                 self._revoked_put_keys.update(failed_keys)
 
+        if _layer_diag_enabled():
+            _emit_layer_diag(
+                {
+                    "event": "save_detail",
+                    "layer_id": int(layer_id),
+                    "keys_total": len(active_keys),
+                    "sync_ms": save_sync_ms,
+                    "put_ms": round(sum(save_batch_ms), 3),
+                    "batch_ms": save_batch_ms,
+                }
+            )
         for req_meta, commit_group in metas:
             if commit_group:
                 self._commit_range_meta(req_meta)
@@ -2215,7 +2233,9 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         if not metas:
             return
 
+        t_enter = time.perf_counter()
         self._stagger_h2d_submit(layer_id)
+        t_stagger = time.perf_counter()
         active_keys: list[str] = []
         all_buffers: list[list[int]] = []
         all_sizes: list[list[int]] = []
@@ -2241,10 +2261,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if active_keys
             else []
         )
+        t_prep = time.perf_counter()
+        batch_ms: list[float] = []
         if _layer_diag_enabled():
             _emit_layer_diag(
                 {
                     "event": "load",
+                    "ts": t_enter,
                     "layer_id": int(layer_id),
                     "groups": [int(task.group_id) for task in transfer_tasks],
                     "keys_per_group": [len(req_meta.keys) for req_meta in metas],
@@ -2257,12 +2280,15 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     "batches": len(diag_batches),
                     "max_transfer_blocks": int(self.max_transfer_blocks),
                     "max_transfer_bytes": int(self.max_transfer_bytes),
+                    "stagger_ms": round((t_stagger - t_enter) * 1000, 3),
+                    "prep_ms": round((t_prep - t_stagger) * 1000, 3),
                     "req_ids": list(dict.fromkeys(req_id for req_meta in metas for req_id in req_meta.req_ids))[:4],
                 }
             )
         if active_keys:
             results: list[int] = []
             for keys, buffers, sizes, offsets in diag_batches:
+                batch_start = time.perf_counter()
                 results.extend(
                     require_aligned_batch_results(
                         "batch_copy_get",
@@ -2270,6 +2296,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
                     )
                 )
+                batch_ms.append(round((time.perf_counter() - batch_start) * 1000, 3))
             _emit_range_debug_event("load", layer_id, all_sizes, all_offsets, results)
             failed_keys = {key for key, result in zip(active_keys, results, strict=True) if result < 0}
             if failed_keys:
@@ -2281,6 +2308,16 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         self._mark_invalid_range_indices(req_meta, failed_indices)
                         self._failed_load_keys.update(req_meta.keys[index] for index in failed_indices)
 
+        if _layer_diag_enabled():
+            _emit_layer_diag(
+                {
+                    "event": "load_copy",
+                    "ts": t_prep,
+                    "layer_id": int(layer_id),
+                    "copy_ms": round((time.perf_counter() - t_prep) * 1000, 3),
+                    "batch_ms": batch_ms,
+                }
+            )
         if layer_id == self.final_layer_id:
             for req_meta in metas:
                 shared = shared_by_meta[id(req_meta)]
