@@ -50,6 +50,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVTransferThread,
     LayerBatchBuilder,
     _circular_shift,
+    _emit_layer_diag,
+    _layer_diag_enabled,
     record_failed_blocks,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -229,6 +231,9 @@ class KVPoolWorker:
         if ramp_value < 2:
             raise ValueError("layerwise_prefetch_ramp must be an integer >= 2")
         self.layerwise_prefetch_ramp = ramp_value
+        # Opt-in fallback: filter out keys that already exist in the pool before
+        # opening a Mooncake put session (avoids re-putting already pooled objects).
+        self.layerwise_put_exists_filter = bool(extra_config.get("layerwise_put_exists_filter", False))
 
         logger.info(
             "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
@@ -1722,12 +1727,21 @@ class KVPoolWorker:
             group_block_size = get_group_block_size(self.grouped_block_size, group_id)
             start_block = request.save_start_token // group_block_size
             end_block = request.save_end_token // group_block_size
+            store_skip_tokens = 0
+            pool_hit_tokens = 0
             if request.load_spec is not None and request.load_spec.can_load:
-                pool_hit_tokens = (
+                store_skip_tokens = (
                     request.load_spec.kvpool_store_skip_tokens
                     if request.load_spec.kvpool_store_skip_tokens is not None
                     else request.load_spec.kvpool_cached_tokens
                 )
+                pool_hit_tokens = store_skip_tokens
+                per_group_hits = getattr(request.load_spec, "kvpool_hits_per_group", None)
+                if per_group_hits is not None and group_id < len(per_group_hits):
+                    # A KV group can be pooled beyond the min-over-groups mask;
+                    # start this group's save at its own prefix so already pooled
+                    # objects are not re-put.
+                    pool_hit_tokens = max(pool_hit_tokens, per_group_hits[group_id])
                 start_block = max(start_block, pool_hit_tokens // group_block_size)
             group_block_hashes = get_block_hashes(
                 request.block_hashes,
@@ -1773,13 +1787,28 @@ class KVPoolWorker:
                 previously_started = set(requested_keys) & self._put_started_keys
                 new_keys = [key for key in requested_keys if key not in self._put_started_keys]
 
+            if new_keys and getattr(self, "layerwise_put_exists_filter", False):
+                try:
+                    exists_states = self.m_store.exists(new_keys)
+                    if len(exists_states) == len(new_keys):
+                        new_keys = [
+                            key for key, state in zip(new_keys, exists_states, strict=True) if not state
+                        ]
+                except Exception as exc:  # pragma: no cover - backend specific
+                    logger.warning("Layerwise put exists-filter failed error=%s", exc)
+
             started = set(previously_started)
+            put_start_ms = 0.0
+            newly_started_count = 0
+            already_existing_count = 0
             if new_keys:
                 try:
+                    put_start_ts = time.perf_counter()
                     results = self._start_mooncake_put_keys(
                         new_keys,
                         self._mooncake_object_size_bytes(group_id),
                     )
+                    put_start_ms = round((time.perf_counter() - put_start_ts) * 1000, 3)
                 except Exception as exc:
                     logger.error("Mooncake batch_put_start failed keys=%s error=%s", new_keys, exc)
                     with self._put_started_keys_lock:
@@ -1787,9 +1816,29 @@ class KVPoolWorker:
                     self._queue_layerwise_revoke_keys(new_keys)
                 else:
                     newly_started = {key for key, result in zip(new_keys, results, strict=True) if result == 0}
+                    newly_started_count = len(newly_started)
+                    already_existing_count = len(new_keys) - newly_started_count
                     with self._put_started_keys_lock:
                         self._put_started_keys.update(newly_started)
                     started.update(newly_started)
+
+            if _layer_diag_enabled():
+                _emit_layer_diag(
+                    {
+                        "event": "put_session",
+                        "req_ids": [request.req_id],
+                        "group_id": int(group_id),
+                        "start_block": int(start_block),
+                        "end_block": int(end_block),
+                        "pool_hit_tokens": int(pool_hit_tokens),
+                        "store_skip_tokens": int(store_skip_tokens),
+                        "keys_total": len(requested_keys),
+                        "new_keys": len(new_keys),
+                        "newly_started": newly_started_count,
+                        "already_existing": already_existing_count,
+                        "put_start_ms": put_start_ms,
+                    }
+                )
 
             for key, slot, _ in key_slots:
                 if key in started:

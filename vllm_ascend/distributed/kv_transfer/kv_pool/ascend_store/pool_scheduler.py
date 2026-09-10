@@ -65,6 +65,9 @@ class KVPoolScheduler:
     ):
         self.vllm_config = vllm_config
         self.use_layerwise = use_layerwise
+        # Per-group pooled prefix from the most recent Mooncake layerwise hit
+        # check; consumed when building the LoadSpec for the save path.
+        self._layerwise_hits_per_group: list[int] | None = None
         self.kv_cache_config = kv_cache_config
         hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
         hf_config = getattr(vllm_config.model_config, "hf_config", hf_text_config)
@@ -478,12 +481,14 @@ class KVPoolScheduler:
                 num_hit_blocks += 1
             hits_per_group.append(num_hit_blocks * effective_block_size)
         if not hits_per_group:
+            self._layerwise_hits_per_group = None
             return 0
         logger.info(
             "Mooncake layerwise hit check request=%s hits_per_group=%s",
             request.request_id,
             hits_per_group,
         )
+        self._layerwise_hits_per_group = list(hits_per_group)
         return min(hits_per_group)
 
     def _get_block_key_layerwise_hit_tokens(
@@ -577,6 +582,7 @@ class KVPoolScheduler:
         ):
             return 0, False
 
+        self._layerwise_hits_per_group = None
         if self.use_gva_layerwise and not self.use_block_key_layerwise:
             token_len = prompt_token_len
             num_external_hit_tokens = self._get_layerwise_gva_hit_tokens(request, token_len, num_computed_tokens)
@@ -652,6 +658,7 @@ class KVPoolScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=force_layerwise_load,
             kvpool_store_skip_tokens=store_skip_tokens,
+            kvpool_hits_per_group=self._layerwise_hits_per_group,
         )
         logger.debug(
             "KV pool load spec created req=%s vllm_cached=%d kvpool_cached=%d "

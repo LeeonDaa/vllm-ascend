@@ -738,6 +738,90 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         load_entries = worker._mooncake_session_tracker.prepare_load_entries("r1", [])
         self.assertEqual(len(load_entries), 5)
 
+    def test_put_start_skips_group_own_pooled_prefix(self):
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 2
+        worker.grouped_block_size = [32, 8]
+        worker.hash_block_size = 8
+        worker.block_size = 32
+        worker.group_block_len = {0: [64], 1: [16]}
+        worker.m_store.batch_put_start.side_effect = [[0], [0]]
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            save_start_token=0,
+            save_end_token=32,
+            block_ids_by_group=[[5], [9, 10, 11, 12]],
+            block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+            can_save=True,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=8,
+                can_load=True,
+                kvpool_store_skip_tokens=8,
+                kvpool_hits_per_group=[8, 24],
+            ),
+        )
+
+        worker._prepare_mooncake_put_session(request)
+
+        # group 0 own hit 8 -> 8//32 = 0 (unchanged); group 1 own hit 24 -> start
+        # at block 3, so only the last 8-token block is saved instead of blocks
+        # 1..3 (the min-over-groups mask only guarded 8 tokens).
+        self.assertEqual(request.save_block_keys_by_group[0], ["model@0@6833@0"])
+        self.assertEqual(request.save_block_keys_by_group[1], ["model@1@6833@0"])
+
+    def test_put_exists_filter_drops_already_pooled_keys(self):
+        worker = self._make_worker()
+        worker.layerwise_put_exists_filter = True
+        worker.m_store.batch_put_start.return_value = [0]
+        worker.m_store.exists.return_value = [1, 0]
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            save_start_token=0,
+            save_end_token=32,
+            block_ids=[1, 2],
+            block_hashes=[b"h0", b"h1"],
+            can_save=True,
+            load_spec=LoadSpec(0, 0, can_load=True, kvpool_store_skip_tokens=0),
+        )
+
+        worker._prepare_mooncake_put_session(request)
+
+        called_keys = worker.m_store.batch_put_start.call_args_list[0].args[0]
+        self.assertEqual(len(called_keys), 1)
+
+    def test_put_session_diag_reports_counts(self):
+        worker = self._make_worker()
+        worker.num_kv_cache_groups = 1
+        worker.m_store.batch_put_start.return_value = [0, 0]
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            save_start_token=0,
+            save_end_token=32,
+            block_ids=[1, 2],
+            block_hashes=[b"h0", b"h1"],
+            can_save=True,
+        )
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker._layer_diag_enabled",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker._emit_layer_diag"
+            ) as emit,
+        ):
+            worker._prepare_mooncake_put_session(request)
+        payloads = [call.args[0] for call in emit.call_args_list]
+        put = [p for p in payloads if p.get("event") == "put_session"]
+        self.assertTrue(put)
+        self.assertIn("already_existing", put[0])
+        self.assertIn("put_start_ms", put[0])
+        self.assertEqual(put[0]["newly_started"], 2)
+
 
 class TestMooncakeSessionTracker(unittest.TestCase):
     def test_commit_promotes_shared_put_key_to_every_request_owner(self):

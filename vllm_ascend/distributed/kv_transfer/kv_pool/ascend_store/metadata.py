@@ -772,6 +772,10 @@ class LoadSpec:
     can_load: bool
     # Raw KVPool hit length used to avoid storing an already pooled prefix.
     kvpool_store_skip_tokens: int | None = None
+    # Per KV-cache-group pooled prefix. A group can be pooled further than the
+    # min-over-groups mask, so the save path uses this to avoid re-putting
+    # already pooled objects. None for single-group / non-mooncake paths.
+    kvpool_hits_per_group: list[int] | None = None
 
     token_len: int = 0
 

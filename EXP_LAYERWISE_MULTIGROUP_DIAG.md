@@ -77,3 +77,17 @@ Python 组装耗时；`copy_ms`/`batch_ms` = 实际 `batch_copy_get` 耗时；`s
 | attention, 2 | | | | 验证预取窗口 |
 | immediate, 2 | | | | |
 | attention, 4 | | | | |
+
+## save 端“重写已存在对象”诊断与修法
+
+- 新增 diag 事件 `[KVPOOL_LAYER_DIAG] {"event":"put_session", ...}`：每组打印
+  `start_block / end_block / pool_hit_tokens / store_skip_tokens / keys_total / new_keys /
+  newly_started / already_existing / put_start_ms`。
+  `already_existing > 0` 即“对已存在对象发起了 put_session_start”；`put_start_ms` 是该 RPC 耗时。
+- 根因：save 起跳原用 **min-over-groups 命中**（`store_skip_tokens`），而各组自身池化前缀可能更长 →
+  `[min, 本组自身命中)` 段被重复 put（master `object_already_exists`）。
+- **修法 A（默认生效）**：scheduler 的 `hits_per_group` 透传到 `LoadSpec.kvpool_hits_per_group`，
+  `_prepare_mooncake_put_session` 对**每组**用本组自身命中作为 save 起跳。缺省为 None 时行为不变。
+- **修法 B（可选兜底）**：`layerwise_put_exists_filter=true` 时，put_session_start 前先用
+  `batch_is_exist` 过滤已存在 key。
+- 验收：master `object_already_exists` 显著下降；尖峰层 `dsa_ms` 回落；`put_start_ms` 不再大额阻塞。
