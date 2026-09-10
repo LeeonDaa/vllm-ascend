@@ -209,6 +209,26 @@ class KVPoolWorker:
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
+        # Anchor for prefetched layerwise loads: "attention" releases the transfer
+        # at the attention compute boundary (default); "immediate" releases it as
+        # soon as the task is submitted (A/B control).
+        anchor = str(extra_config.get("layerwise_anchor", "attention")).lower()
+        if anchor not in ("attention", "immediate"):
+            raise ValueError("layerwise_anchor must be 'attention' or 'immediate'")
+        self.layerwise_anchor = anchor
+        # Max number of new prefetch loads released per wait_for_layer_load call.
+        # A value >= 2 ramps the window up gradually instead of bursting every
+        # layer at once; 1 would starve the window, so it is rejected.
+        ramp = extra_config.get("layerwise_prefetch_ramp", 2)
+        if isinstance(ramp, bool):
+            raise ValueError("layerwise_prefetch_ramp must be an integer >= 2")
+        try:
+            ramp_value = int(ramp)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("layerwise_prefetch_ramp must be an integer >= 2") from exc
+        if ramp_value < 2:
+            raise ValueError("layerwise_prefetch_ramp must be an integer >= 2")
+        self.layerwise_prefetch_ramp = ramp_value
 
         logger.info(
             "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
@@ -2137,7 +2157,11 @@ class KVPoolWorker:
             if not self.layer_load_tasks[layer_id] and reuse_source is None:
                 return False
             attention_start_gate = None
-            if self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
+            if (
+                self.layerwise_anchor == "attention"
+                and self.layer_load_tasks[layer_id]
+                and layer_id != self.current_layer
+            ):
                 attention_start_gate = get_attention_compute_start_gate()
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]
@@ -2149,7 +2173,12 @@ class KVPoolWorker:
             )
             return True
 
-        submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
+        # Keep exactly ``num_prefetch_layers`` loads in flight, but cap how many are
+        # released per call so the first layers ramp up instead of bursting every
+        # prefetch at once (which floods the shared SDMA engine used by collectives).
+        lead = self.next_layer_to_submit - self.current_layer
+        remaining = max(0, self.num_prefetch_layers - lead)
+        submit_count = min(remaining, self.layerwise_prefetch_ramp)
         submitted_layers = 0
         while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
             layer_id = self.next_layer_to_submit

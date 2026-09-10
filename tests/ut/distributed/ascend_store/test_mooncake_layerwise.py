@@ -16,8 +16,9 @@
 #
 
 import threading
+import types
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -360,6 +361,67 @@ class TestMooncakeRangeMultiGroupBatchedTransfer(unittest.TestCase):
         thread._handle_request(data)
         # One batched get covering both groups per physical layer.
         self.assertEqual(store.batch_copy_get.call_count, 1)
+
+
+class TestMooncakePrefetchAnchoring(unittest.TestCase):
+    """Prefetch release anchoring (attention vs immediate) and ramped window fill."""
+
+    def _make_worker(self, **overrides):
+        num_layers = overrides.get("num_layers", 20)
+        worker = types.SimpleNamespace(
+            kv_recv_thread=MagicMock(),
+            prefetch_layer_map={},
+            layer_load_tasks=[[object()] for _ in range(num_layers)],
+            current_layer=0,
+            num_prefetch_layers=4,
+            next_layer_to_submit=0,
+            num_layers=num_layers,
+            layerwise_anchor="attention",
+            layerwise_prefetch_ramp=2,
+        )
+        for key, value in overrides.items():
+            setattr(worker, key, value)
+        return worker
+
+    def _submitted_tasks(self, worker):
+        return [call.args[0] for call in worker.kv_recv_thread.add_request.call_args_list]
+
+    def test_anchor_attention_gates_only_prefetched_layers(self):
+        worker = self._make_worker()
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_attention_compute_start_gate",
+            return_value="gate",
+        ):
+            KVPoolWorker._submit_ready_layer_loads(worker)
+        tasks = self._submitted_tasks(worker)
+        # The current layer is loaded without a gate; prefetched layers get the gate.
+        self.assertIsNone(tasks[0].attention_start_gate)
+        self.assertEqual(tasks[1].attention_start_gate, "gate")
+
+    def test_anchor_immediate_never_gates(self):
+        worker = self._make_worker(layerwise_anchor="immediate")
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_attention_compute_start_gate",
+        ) as gate:
+            KVPoolWorker._submit_ready_layer_loads(worker)
+        gate.assert_not_called()
+        self.assertTrue(all(task.attention_start_gate is None for task in self._submitted_tasks(worker)))
+
+    def test_prefetch_ramp_does_not_burst(self):
+        worker = self._make_worker(num_prefetch_layers=4, layerwise_prefetch_ramp=2)
+        KVPoolWorker._submit_ready_layer_loads(worker)
+        # First release is capped at the ramp, not the whole window.
+        self.assertEqual(worker.next_layer_to_submit, 2)
+
+    def test_prefetch_ramp_maintains_window(self):
+        worker = self._make_worker(num_prefetch_layers=4, layerwise_prefetch_ramp=2)
+        for _ in range(8):
+            KVPoolWorker._submit_ready_layer_loads(worker)
+            worker.current_layer += 1
+        lead = worker.next_layer_to_submit - worker.current_layer
+        # The window settles one below the target (same steady state the original
+        # layer-0 burst produced), without the initial burst.
+        self.assertEqual(lead, worker.num_prefetch_layers - 1)
 
 
 class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
