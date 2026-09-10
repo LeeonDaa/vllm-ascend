@@ -37,10 +37,14 @@ than concentrated as a single blocking step.
 
 ## Prerequisites
 
-Layerwise mode currently requires the **memcache** backend
-(`backend: "memcache"`). Install and configure memcache_hybrid before
-proceeding — see the [KV Pool guide](kv_pool.md) for memcache installation,
-config files (`mmc-meta.conf` / `mmc-local.conf`), and MetaService startup.
+Layerwise mode supports the **memcache** and **Mooncake** backends. Install and
+configure the selected backend as described in the [KV Pool guide](kv_pool.md).
+
+Mooncake layerwise additionally requires a Mooncake client containing the
+session/range APIs introduced by
+[Mooncake PR #2881](https://github.com/kvcache-ai/Mooncake/pull/2881). The
+connector validates all required methods during KV-cache registration and
+fails before serving traffic when the installed client is too old.
 
 Additional setup:
 
@@ -74,16 +78,38 @@ Add `use_layerwise: true` to the `AscendStoreConnector` extra config:
 
 Change `"kv_role"` to `"kv_producer"` or `"kv_consumer"` for PD disaggregation.
 
+For Mooncake, configure `MOONCAKE_CONFIG_PATH` as usual and select the backend:
+
+```json
+{
+    "kv_connector": "AscendStoreConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "backend": "mooncake",
+        "use_layerwise": true,
+        "layerwise_prefetch_layers": 2,
+        "layerwise_max_transfer_blocks": 64,
+        "layerwise_max_transfer_bytes": 16777216
+    }
+}
+```
+
+Mooncake stores one object for each `(model, block hash, saving TP/head rank)`.
+Every object's byte layout is the concatenation of all local KV layers. A put
+session is opened before the forward pass, each layer writes only its byte
+range, and the object is committed after the final layer succeeds. Loads use a
+get session over the same object and read one layer range at a time.
+
 ### Key Parameters
 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
-| `use_layerwise` | `false` | Enable layer-by-layer KV save/load. Requires `backend: "memcache"`. |
-| `backend` | `"mooncake"` | Storage backend. Layerwise currently supports `"memcache"` only. |
+| `use_layerwise` | `false` | Enable layer-by-layer KV save/load. Supported with `backend: "memcache"` or `"mooncake"`. |
+| `backend` | `"mooncake"` | Storage backend. |
 | `mooncake_rpc_port` | `"0"` | RPC port for the scheduler↔worker lookup service. Use `"0"` to auto-assign, or a unique port per instance. |
-| `layerwise_prefetch_layers` | `1` | Number of layers to prefetch ahead of the compute frontier. Higher values improve overlap at the cost of memory. |
+| `layerwise_prefetch_layers` | `1` | Positive number of layers to prefetch ahead of the compute frontier. Higher values improve overlap at the cost of memory. |
 | `layerwise_max_transfer_blocks` | `0` (unlimited) | Maximum number of KV blocks per transfer batch. |
-| `layerwise_max_transfer_bytes` | `0` (unlimited) | Maximum bytes per transfer batch. |
+| `layerwise_max_transfer_bytes` | `0` (unlimited) | Maximum bytes in one contiguous transfer segment; larger segments are split. |
 | `h2d_stagger_us` | `0` | Stagger delay (microseconds) between H2D copies across TP ranks to avoid bus contention. |
 | `discard_partial_chunks` | `true` (non-layerwise) / `false` (layerwise) | Whether to discard KV for incomplete chunk boundaries. Layerwise defaults to `false` to preserve partial layers. |
 
@@ -215,6 +241,10 @@ Use `layerwise_max_transfer_blocks` or `layerwise_max_transfer_bytes` to limit
 the size of each transfer batch. This prevents a single large layer from
 monopolizing the transfer bus. Set to `0` (default) for unlimited.
 
+For temporary range/commit audit logs during Mooncake rollout, set
+`VLLM_ASCEND_KVPOOL_RANGE_DEBUG=1`. Leave it at the default `0` in normal
+operation because the per-layer JSON logs are verbose.
+
 ### H2D Stagger
 
 On multi-TP deployments, H2D (host-to-device) copies for all TP ranks can
@@ -232,11 +262,17 @@ wait/save calls. Layerwise + CP is future work.
 
 ## Limitations
 
-* **Backend**: Only `memcache` is supported for layerwise mode (`mooncake` and
-  `yuanrong` do not support `use_layerwise`).
-* **Hybrid KV cache**: Not supported — layerwise raises
-  `NotImplementedError` when the model has multiple KV cache group families
-  (hybrid MLA + sliding-window attention).
+* **Backend**: `memcache` and `mooncake` support layerwise mode; `yuanrong`
+  still uses whole-key transfer.
+* **Mooncake topology**: The current block key is TP-only. Pipeline parallel,
+  prefill-context parallel, and decode-context parallel sizes must all be `1`.
+  Prefill/decode TP mismatch is also rejected.
+* **Mooncake hybrid KV cache**: Multiple KV-cache groups are supported in the
+  range-session path (V2, experimental): one object per
+  `(group, block hash, saving TP/head rank)` with per-group layer offsets and
+  per-group commit, mirroring the MemCache multi-group schema (#12147). The
+  key format becomes `model@group_id@hash@rank` when more than one group is
+  present; keep all Prefill/Decode/scheduler processes on the same build.
 * **Context parallel**: Layerwise is not yet integrated with CP attention
   backends.
 * **PD disaggregation proxy**: When using `kv_producer` / `kv_consumer`, the

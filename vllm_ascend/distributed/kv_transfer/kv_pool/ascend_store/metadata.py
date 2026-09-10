@@ -16,6 +16,65 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
 
 
+def make_layerwise_block_key(
+    model_name: str,
+    block_hash_or_tail: str,
+    head_or_tp_rank: int,
+    group_id: int = 0,
+    num_groups: int = 1,
+) -> str:
+    """Build the canonical one-object-per-group-block-and-saving-rank key.
+
+    Single-group models keep the historical ``model@hash@rank`` format.
+    Multi-group (hybrid) models include the group id
+    (``model@group_id@hash@rank``) so that DSV4 groups with different block
+    sizes and layer offsets never alias each other — mirroring the MemCache
+    multi-group key layout from #12147 / RFC #12234.
+    """
+    if num_groups > 1:
+        return f"{model_name}@{group_id}@{block_hash_or_tail}@{head_or_tp_rank}"
+    return f"{model_name}@{block_hash_or_tail}@{head_or_tp_rank}"
+
+
+def is_block_key_layerwise(use_layerwise: bool, backend_name: str) -> bool:
+    return use_layerwise and backend_name.lower() in {"memcache", "mooncake"}
+
+
+def is_kv_save_role(kv_role: str, consumer_is_to_put: bool) -> bool:
+    return kv_role in ("kv_producer", "kv_both") or consumer_is_to_put
+
+
+def validate_mooncake_layerwise_topology(
+    parallel_config: Any,
+    backend_name: str,
+    use_layerwise: bool,
+) -> None:
+    """Reject coordinates omitted from the current Mooncake block key."""
+    if not use_layerwise or backend_name.lower() != "mooncake":
+        return
+
+    def parallel_size(name: str) -> int:
+        value = getattr(parallel_config, name, 1)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 1
+
+    topology_dimensions = (
+        ("pipeline_parallel_size", parallel_size("pipeline_parallel_size")),
+        (
+            "prefill_context_parallel_size",
+            parallel_size("prefill_context_parallel_size"),
+        ),
+        (
+            "decode_context_parallel_size",
+            parallel_size("decode_context_parallel_size"),
+        ),
+    )
+    unsupported = [f"{name}={size}" for name, size in topology_dimensions if size > 1]
+    if unsupported:
+        raise ValueError(
+            "Mooncake block-key layerwise currently supports TP-only topology; unsupported " + ", ".join(unsupported)
+        )
+
+
 @dataclass(frozen=True)
 class TPMismatchInfo:
     enabled: bool
@@ -900,6 +959,19 @@ class ReqMeta:
         load_gva_block_offset: int = 0,
         partial_save_gva_per_group: list[int] | None = None,
         partial_load_gva_per_group: list[int] | None = None,
+        save_block_keys: list[str | None] | None = None,
+        save_key_block_offset: int = 0,
+        save_last_block_key: str | None = None,
+        load_block_keys: list[str | None] | None = None,
+        load_key_block_offset: int = 0,
+        load_last_block_key: str | None = None,
+        load_keys: list[str] | None = None,
+        save_block_keys_by_group: list[list[str | None]] | None = None,
+        save_last_block_key_by_group: list[str | None] | None = None,
+        save_key_block_offset_by_group: list[int] | None = None,
+        load_block_keys_by_group: list[list[str | None]] | None = None,
+        load_last_block_key_by_group: list[str | None] | None = None,
+        load_key_block_offset_by_group: list[int] | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -934,6 +1006,31 @@ class ReqMeta:
         self.load_gva_block_offset = load_gva_block_offset
         self.partial_save_gva_per_group = partial_save_gva_per_group or []
         self.partial_load_gva_per_group = partial_load_gva_per_group or []
+        self.save_block_keys = [] if save_block_keys is None else list(save_block_keys)
+        self.save_key_block_offset = save_key_block_offset
+        self.save_last_block_key = save_last_block_key
+        self.load_block_keys = [] if load_block_keys is None else list(load_block_keys)
+        self.load_key_block_offset = load_key_block_offset
+        self.load_last_block_key = load_last_block_key
+        self.load_keys = [] if load_keys is None else list(load_keys)
+        self.save_block_keys_by_group = (
+            [] if save_block_keys_by_group is None else [list(keys) for keys in save_block_keys_by_group]
+        )
+        self.save_last_block_key_by_group = (
+            [] if save_last_block_key_by_group is None else list(save_last_block_key_by_group)
+        )
+        self.save_key_block_offset_by_group = (
+            [] if save_key_block_offset_by_group is None else list(save_key_block_offset_by_group)
+        )
+        self.load_block_keys_by_group = (
+            [] if load_block_keys_by_group is None else [list(keys) for keys in load_block_keys_by_group]
+        )
+        self.load_last_block_key_by_group = (
+            [] if load_last_block_key_by_group is None else list(load_last_block_key_by_group)
+        )
+        self.load_key_block_offset_by_group = (
+            [] if load_key_block_offset_by_group is None else list(load_key_block_offset_by_group)
+        )
 
     @property
     def block_ids(self) -> list[int]:
@@ -946,7 +1043,19 @@ class ReqMeta:
     last_block_gva: int | None = None
     partial_block_index: int | None = None
     save_keys: list[str] | None = None
-    load_keys: list[str] | None = None
+    load_keys: list[str] = field(default_factory=list)
+    save_block_keys: list[str | None] = field(default_factory=list)
+    save_key_block_offset: int = 0
+    save_last_block_key: str | None = None
+    load_block_keys: list[str | None] = field(default_factory=list)
+    load_key_block_offset: int = 0
+    load_last_block_key: str | None = None
+    save_block_keys_by_group: list[list[str | None]] = field(default_factory=list)
+    save_last_block_key_by_group: list[str | None] = field(default_factory=list)
+    save_key_block_offset_by_group: list[int] = field(default_factory=list)
+    load_block_keys_by_group: list[list[str | None]] = field(default_factory=list)
+    load_last_block_key_by_group: list[str | None] = field(default_factory=list)
+    load_key_block_offset_by_group: list[int] = field(default_factory=list)
 
     block_ids_np: np.ndarray | None = None
     block_ids_by_group_np: list[np.ndarray] | None = None
@@ -1099,6 +1208,19 @@ class LayerBatchReqMeta:
 
 
 @dataclass
+class LayerRangeReqMeta:
+    req_ids: list[str]
+    layer_id: int
+    block_ids: list[int]
+    keys: list[str]
+    all_buffers: list[list[int]]
+    all_sizes: list[list[int]]
+    all_offsets: list[list[int]]
+    is_last_chunks: list[bool | None] = field(default_factory=list)
+    load_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
 class LayerBlockRange:
     request: ReqMeta
     start_block: int
@@ -1111,9 +1233,10 @@ class SharedBlockData:
     """Pre-computed block data shared across all layers for the same request."""
 
     block_ids_arr: np.ndarray
-    block_gvas_arr: np.ndarray
+    block_gvas_arr: np.ndarray | None
     req_ids: list[str]
     is_last_chunks: list[bool | None]
+    block_keys: list[str] | None = None
     save_keys: list[str] = field(default_factory=list)
     load_keys: list[str] = field(default_factory=list)
 
@@ -1131,6 +1254,8 @@ class LayerTransferTask:
     # Cache for KVCacheStoreKeyLayerSendingThread:
     # maps block_range index -> list of (start, end, key_all_layers)
     cached_process_tokens: dict[int, list[tuple[int, int, list]]] | None = None
+    # Mooncake uses one remote object per block/rank with per-layer ranges.
+    use_key_major_ranges: bool = False
 
 
 @dataclass

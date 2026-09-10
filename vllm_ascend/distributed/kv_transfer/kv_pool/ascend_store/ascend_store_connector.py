@@ -28,7 +28,12 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendStoreKVConnectorWorkerMetadata
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendStoreKVConnectorWorkerMetadata,
+    is_block_key_layerwise,
+    is_kv_save_role,
+    validate_mooncake_layerwise_topology,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
     get_zmq_rpc_path_lookup,
@@ -89,6 +94,15 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.use_layerwise = extra_config.get("use_layerwise", False)
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
+        self.backend_name = extra_config.get("backend", "mooncake").lower()
+        self.use_block_key_layerwise = is_block_key_layerwise(self.use_layerwise, self.backend_name)
+        self.use_memcache_gva_layerwise = self.use_block_key_layerwise and self.backend_name == "memcache"
+        self.use_gva_layerwise = self.use_memcache_gva_layerwise
+        validate_mooncake_layerwise_topology(
+            vllm_config.parallel_config,
+            self.backend_name,
+            self.use_layerwise,
+        )
 
         connector_name = vllm_config.kv_transfer_config.kv_connector
         if connector_name == "MooncakeConnectorStoreV1":
@@ -235,13 +249,13 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if not self.use_layerwise:
             return
 
-        if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
+        if not is_kv_save_role(self.kv_role, self.consumer_is_to_put):
             # A load-only consumer does not publish KV.
             return
         self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):
-        if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
+        if not is_kv_save_role(self.kv_role, self.consumer_is_to_put):
             # Don't do save if the role is kv_consumer
             return
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import re
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -31,6 +32,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import (
+    require_aligned_batch_results,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
     AscendStoreCoordinator,
@@ -74,7 +78,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_group_block_sizes,
     infer_group_cache_families,
     infer_tp_mismatch_info,
+    is_block_key_layerwise,
+    is_kv_save_role,
+    make_layerwise_block_key,
     uses_hybrid_kv_cache,
+    validate_mooncake_layerwise_topology,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mooncake_session_tracker import (
+    MooncakeSessionTracker,
 )
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
@@ -119,6 +130,8 @@ class KVPoolWorker:
         self._init_parallelism_info(model_config, parallel_config)
         self._init_kv_transfer_config(vllm_config, extra_config, use_layerwise, kv_cache_config)
         self._init_key_head_config(model_config, parallel_config)
+        if self.backend_name == "mooncake" and self.use_layerwise and self.tp_mismatch:
+            raise ValueError("Mooncake layerwise does not yet support prefill/decode TP mismatch")
         self._init_metadata(model_config, vllm_config, extra_config)
         self._init_backend(parallel_config, extra_config)
         self._init_kv_events(vllm_config)
@@ -154,9 +167,22 @@ class KVPoolWorker:
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self.backend = extra_config.get("backend", "mooncake")
         self.backend_name = self.backend.lower()
-        self.use_gva_layerwise = self.use_layerwise and self.backend_name == "memcache"
+        self.use_block_key_layerwise = is_block_key_layerwise(self.use_layerwise, self.backend_name)
+        self.use_memcache_gva_layerwise = self.use_block_key_layerwise and self.backend_name == "memcache"
+        # Compatibility alias for the existing Memcache GVA/offload path.
+        self.use_gva_layerwise = self.use_memcache_gva_layerwise
+        validate_mooncake_layerwise_topology(
+            vllm_config.parallel_config,
+            self.backend_name,
+            self.use_layerwise,
+        )
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
         self.use_hybrid = uses_hybrid_kv_cache(vllm_config.scheduler_config, kv_cache_groups)
+        if self.backend_name == "mooncake" and self.use_layerwise and self.use_hybrid:
+            logger.warning(
+                "Mooncake range-session layerwise hybrid/multi-group KV is enabled (V2, experimental). "
+                "Object keys, sessions and hit checks are split per KV cache group."
+            )
         self.use_mamba = self._uses_mamba_kv_cache(self.use_hybrid, kv_cache_config)
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
@@ -183,6 +209,26 @@ class KVPoolWorker:
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
+        # Anchor for prefetched layerwise loads: "attention" releases the transfer
+        # at the attention compute boundary (default); "immediate" releases it as
+        # soon as the task is submitted (A/B control).
+        anchor = str(extra_config.get("layerwise_anchor", "attention")).lower()
+        if anchor not in ("attention", "immediate"):
+            raise ValueError("layerwise_anchor must be 'attention' or 'immediate'")
+        self.layerwise_anchor = anchor
+        # Max number of new prefetch loads released per wait_for_layer_load call.
+        # A value >= 2 ramps the window up gradually instead of bursting every
+        # layer at once; 1 would starve the window, so it is rejected.
+        ramp = extra_config.get("layerwise_prefetch_ramp", 2)
+        if isinstance(ramp, bool):
+            raise ValueError("layerwise_prefetch_ramp must be an integer >= 2")
+        try:
+            ramp_value = int(ramp)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("layerwise_prefetch_ramp must be an integer >= 2") from exc
+        if ramp_value < 2:
+            raise ValueError("layerwise_prefetch_ramp must be an integer >= 2")
+        self.layerwise_prefetch_ramp = ramp_value
 
         logger.info(
             "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
@@ -344,6 +390,13 @@ class KVPoolWorker:
         # which keys it has already allocated and reuse those GVAs instead of
         # re-allocating them on every save step.
         self._allocated_gvas: dict[str, int] = {}
+        self._put_started_keys: set[str] = set()
+        self._put_started_keys_lock = threading.Lock()
+        self._load_session_lock = threading.Lock()
+        self._layer_load_aborted = threading.Event()
+        self._mooncake_session_tracker = MooncakeSessionTracker()
+        self._current_mooncake_request_ids: set[str] = set()
+        self._current_mooncake_last_chunk_req_ids: set[str] = set()
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -431,7 +484,17 @@ class KVPoolWorker:
                 self.prefetch_layer_map = self._layerwise_reuse_layout.prefetch_layer_map
                 self.num_prefetch_layers = self._layerwise_reuse_layout.num_prefetch_layers
         else:
-            self.num_prefetch_layers = int(self._extra_config.get("layerwise_prefetch_layers", 1))
+            self.num_prefetch_layers = 1
+            if self.use_layerwise:
+                prefetch_layers = self._extra_config.get("layerwise_prefetch_layers", 1)
+                if isinstance(prefetch_layers, bool):
+                    raise ValueError("layerwise_prefetch_layers must be a positive integer")
+                try:
+                    self.num_prefetch_layers = int(prefetch_layers)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("layerwise_prefetch_layers must be a positive integer") from exc
+                if self.num_prefetch_layers <= 0:
+                    raise ValueError("layerwise_prefetch_layers must be a positive integer")
         self.sync_save_events: list[torch.npu.Event] | None = None
 
         logger.info(
@@ -469,8 +532,8 @@ class KVPoolWorker:
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
-            can_save = self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put
-            if self.use_gva_layerwise and can_save:
+            can_save = is_kv_save_role(self.kv_role, self.consumer_is_to_put)
+            if self.use_block_key_layerwise and can_save:
                 ready_event_sending = threading.Event()
                 self.kv_send_thread = KVCacheStoreLayerSendingThread(
                     self.m_store,
@@ -487,6 +550,10 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
+                    num_kv_cache_groups=self.num_kv_cache_groups,
+                    put_started_keys=self._put_started_keys,
+                    put_started_keys_lock=self._put_started_keys_lock,
+                    session_tracker=self._mooncake_session_tracker if self.backend_name == "mooncake" else None,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -508,7 +575,7 @@ class KVPoolWorker:
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
             ready_event = threading.Event()
-            if self.use_gva_layerwise:
+            if self.use_block_key_layerwise:
                 self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                     self.m_store,
                     self.token_database,
@@ -523,14 +590,18 @@ class KVPoolWorker:
                     self.layer_save_finished_events,
                     self.sync_save_events,
                     self.num_layers,
-                    self.h2d_stagger_us,
-                    self.layerwise_max_transfer_blocks,
-                    self.layerwise_max_transfer_bytes,
+                    num_kv_cache_groups=self.num_kv_cache_groups,
+                    h2d_stagger_us=self.h2d_stagger_us,
+                    max_transfer_blocks=self.layerwise_max_transfer_blocks,
+                    max_transfer_bytes=self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
                     external_slot_release_waiter=self.external_slot_release_waiter,
                     save_failure_checker=(
                         self.kv_send_thread.raise_if_failed if self.kv_send_thread is not None else None
                     ),
+                    invalid_block_ids=self._invalid_block_ids,
+                    invalid_block_ids_lock=self._invalid_block_ids_lock,
+                    load_abort_event=self._layer_load_aborted,
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -816,6 +887,8 @@ class KVPoolWorker:
         if self.use_gva_layerwise:
             self.m_store.ensure_initialized()
         self.m_store.register_buffer(ptrs, lengths)
+        if self.backend_name == "mooncake" and self.use_layerwise:
+            self.m_store.validate_layerwise_support()
         self._start_kv_transfer_threads()
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
@@ -1027,6 +1100,7 @@ class KVPoolWorker:
                     block_ranges=request_block_ranges,
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
+                    use_key_major_ranges=(self.use_block_key_layerwise and self.backend_name == "mooncake"),
                 )
             )
 
@@ -1040,6 +1114,27 @@ class KVPoolWorker:
         block_size = get_group_block_size(self.grouped_block_size, group_id)
         request_block_ranges = []
         for request in requests:
+            if self.use_block_key_layerwise and self.backend_name == "mooncake":
+                # Mooncake sessions retain committed block ownership across
+                # chunked-prefill steps.  A later chunk can therefore have no
+                # new load_spec while still needing to restore the previously
+                # committed prefix into its newly allocated local blocks.
+                group_load_keys = (
+                    request.load_block_keys_by_group[group_id]
+                    if group_id < len(request.load_block_keys_by_group) and request.load_block_keys_by_group[group_id]
+                    else request.load_block_keys
+                )
+                populated_slots = [index for index, key in enumerate(group_load_keys) if key is not None]
+                if not populated_slots:
+                    continue
+                request_block_ranges.append(
+                    LayerBlockRange(
+                        request=request,
+                        start_block=min(populated_slots),
+                        end_block=max(populated_slots) + 1,
+                    )
+                )
+                continue
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
             cached_tokens = request.load_spec.kvpool_cached_tokens
@@ -1091,6 +1186,7 @@ class KVPoolWorker:
                     block_ranges=request_block_ranges,
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
+                    use_key_major_ranges=(self.use_block_key_layerwise and self.backend_name == "mooncake"),
                 )
             )
 
@@ -1514,6 +1610,441 @@ class KVPoolWorker:
                 request.load_block_gvas_np = all_group_load_gvas[0]
                 request.load_gva_block_offset = 0
 
+    def _record_layerwise_invalid_blocks(self, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+        if (
+            self.backend_name == "mooncake"
+            and self.use_block_key_layerwise
+            and getattr(self, "num_kv_cache_groups", 1) > 1
+        ):
+            raise RuntimeError(
+                "Layerwise multi-group KV load failed and cannot safely fall "
+                "back to per-block recomputation: "
+                f"failed_blocks={block_ids}"
+            )
+        with self._invalid_block_ids_lock:
+            self._invalid_block_ids.update(block_ids)
+
+    def _is_layerwise_save_owner(self) -> bool:
+        return is_kv_save_role(self.kv_role, self.consumer_is_to_put) and self.tp_rank % self.put_step == 0
+
+    def _mooncake_key_batches(self, keys: list[str]) -> list[list[str]]:
+        batch_size = self.layerwise_max_transfer_blocks if self.layerwise_max_transfer_blocks > 0 else max(1, len(keys))
+        return [keys[start : start + batch_size] for start in range(0, len(keys), batch_size)]
+
+    def _start_mooncake_put_keys(self, keys: list[str], object_size: int) -> list[int]:
+        results: list[int] = []
+        for key_batch in self._mooncake_key_batches(keys):
+            results.extend(
+                require_aligned_batch_results(
+                    "batch_put_start",
+                    key_batch,
+                    self.m_store.batch_put_start(key_batch, [object_size] * len(key_batch)),
+                )
+            )
+        return results
+
+    def _start_mooncake_get_keys(self, keys: list[str]) -> list[int]:
+        results: list[int] = []
+        for key_batch in self._mooncake_key_batches(keys):
+            results.extend(
+                require_aligned_batch_results(
+                    "batch_get_start",
+                    key_batch,
+                    self.m_store.batch_get_start(key_batch),
+                )
+            )
+        return results
+
+    def _mooncake_object_size_bytes(self, group_id: int = 0) -> int:
+        group_block_len = getattr(self, "group_block_len", {}).get(group_id, [])
+        object_size = sum(group_block_len) if group_block_len else self.page_size_bytes
+        if object_size <= 0:
+            raise RuntimeError(f"Mooncake layerwise object size must be positive, got {object_size}")
+        return object_size
+
+    def _queue_layerwise_revoke_keys(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        try:
+            assert isinstance(self.kv_send_thread, KVCacheStoreLayerSendingThread)
+            self.kv_send_thread.add_revoke_request(keys)
+        except Exception as exc:
+            logger.error("Failed to queue Mooncake revoke keys=%s error=%s", keys, exc)
+            with self._put_started_keys_lock:
+                self._put_started_keys.difference_update(keys)
+
+    def _end_mooncake_load_keys(self, keys: list[str]) -> None:
+        for key_batch in self._mooncake_key_batches(list(dict.fromkeys(keys))):
+            try:
+                result = self.m_store.batch_get_end(key_batch)
+                if result != 0:
+                    logger.error("Mooncake batch_get_end failed keys=%s result=%s", key_batch, result)
+            except Exception as exc:
+                logger.error("Mooncake batch_get_end raised keys=%s error=%s", key_batch, exc)
+
+    def _release_mooncake_requests_for_retry(self, req_ids: set[str]) -> None:
+        with self._load_session_lock:
+            self._end_mooncake_load_keys(self._mooncake_session_tracker.release_for_retry(req_ids))
+
+    def _release_mooncake_requests_terminal(self, req_ids: set[str]) -> None:
+        with self._load_session_lock:
+            self._end_mooncake_load_keys(self._mooncake_session_tracker.release_terminal(req_ids))
+
+    def _release_failed_mooncake_get_attempts(self, request_ids_by_key: dict[str, set[str]]) -> None:
+        with self._load_session_lock:
+            keys = self._mooncake_session_tracker.release_failed_get_attempts(request_ids_by_key)
+            self._end_mooncake_load_keys(keys)
+
+    def _finish_current_mooncake_load_sessions(self) -> None:
+        if self.backend_name != "mooncake" or not self.use_layerwise:
+            return
+        if self._layer_load_aborted.is_set():
+            req_ids = self._current_mooncake_request_ids.copy()
+            self._release_mooncake_requests_for_retry(req_ids)
+        else:
+            req_ids = self._current_mooncake_last_chunk_req_ids.copy()
+            self._release_mooncake_requests_terminal(req_ids)
+        self._current_mooncake_request_ids.difference_update(req_ids)
+        self._current_mooncake_last_chunk_req_ids.difference_update(req_ids)
+
+    def _prepare_mooncake_put_session(self, request: ReqMeta) -> None:
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(self.grouped_block_size)
+        request.save_block_keys_by_group = [[] for _ in range(num_groups)]
+        request.save_last_block_key_by_group = [None] * num_groups
+        request.save_key_block_offset_by_group = [0] * num_groups
+        if not self._is_layerwise_save_owner() or not request.can_save:
+            return
+        for group_id in range(num_groups):
+            group_block_size = get_group_block_size(self.grouped_block_size, group_id)
+            start_block = request.save_start_token // group_block_size
+            end_block = request.save_end_token // group_block_size
+            if request.load_spec is not None and request.load_spec.can_load:
+                pool_hit_tokens = (
+                    request.load_spec.kvpool_store_skip_tokens
+                    if request.load_spec.kvpool_store_skip_tokens is not None
+                    else request.load_spec.kvpool_cached_tokens
+                )
+                start_block = max(start_block, pool_hit_tokens // group_block_size)
+            group_block_hashes = get_block_hashes(
+                request.block_hashes,
+                group_block_size,
+                self.hash_block_size,
+            )
+            request.save_key_block_offset_by_group[group_id] = start_block
+            group_keys: list[str | None] = [None] * max(0, end_block - start_block)
+            request.save_block_keys_by_group[group_id] = group_keys
+            key_slots: list[tuple[str, int | None, int]] = []
+            for block_index in range(start_block, min(end_block, len(group_block_hashes))):
+                key = make_layerwise_block_key(
+                    self.model_name,
+                    block_hash_to_str(group_block_hashes[block_index]),
+                    self.head_or_tp_rank,
+                    group_id=group_id,
+                    num_groups=num_groups,
+                )
+                group_keys[block_index - start_block] = key
+                key_slots.append((key, block_index - start_block, block_index))
+
+            partial_index = request.partial_block_index
+            group_block_ids = self._request_group_block_ids(request, group_id)
+            if partial_index is not None and 0 <= partial_index < len(group_block_ids):
+                if num_groups > 1:
+                    partial_tag = f"{request.req_id}_lastblock_g{group_id}"
+                else:
+                    partial_tag = f"{request.req_id}_lastblock"
+                last_key = make_layerwise_block_key(
+                    self.model_name,
+                    partial_tag,
+                    self.head_or_tp_rank,
+                    group_id=group_id,
+                    num_groups=num_groups,
+                )
+                request.save_last_block_key_by_group[group_id] = last_key
+                key_slots.append((last_key, None, partial_index))
+
+            requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
+            if not requested_keys:
+                continue
+            with self._put_started_keys_lock:
+                previously_started = set(requested_keys) & self._put_started_keys
+                new_keys = [key for key in requested_keys if key not in self._put_started_keys]
+
+            started = set(previously_started)
+            if new_keys:
+                try:
+                    results = self._start_mooncake_put_keys(
+                        new_keys,
+                        self._mooncake_object_size_bytes(group_id),
+                    )
+                except Exception as exc:
+                    logger.error("Mooncake batch_put_start failed keys=%s error=%s", new_keys, exc)
+                    with self._put_started_keys_lock:
+                        self._put_started_keys.update(new_keys)
+                    self._queue_layerwise_revoke_keys(new_keys)
+                else:
+                    newly_started = {key for key, result in zip(new_keys, results, strict=True) if result == 0}
+                    with self._put_started_keys_lock:
+                        self._put_started_keys.update(newly_started)
+                    started.update(newly_started)
+
+            for key, slot, _ in key_slots:
+                if key in started:
+                    if slot is None:
+                        request.save_last_block_key_by_group[group_id] = key
+                elif slot is None:
+                    request.save_last_block_key_by_group[group_id] = None
+                else:
+                    group_keys[slot] = None
+            self._mooncake_session_tracker.register_put_keys(
+                request.req_id,
+                (
+                    (key, self._encode_mooncake_block_index(group_id, block_index))
+                    for key, _, block_index in key_slots
+                    if key in started
+                ),
+            )
+
+        # Single-group compatibility aliases used by the legacy code paths and
+        # existing unit tests.
+        if num_groups == 1:
+            request.save_block_keys = request.save_block_keys_by_group[0]
+            request.save_last_block_key = request.save_last_block_key_by_group[0]
+            request.save_key_block_offset = request.save_key_block_offset_by_group[0]
+
+    def _request_group_block_ids(self, request: ReqMeta, group_id: int) -> list[int]:
+        if request.block_ids_by_group_np is not None and group_id < len(request.block_ids_by_group_np):
+            return request.block_ids_by_group_np[group_id].tolist()
+        if group_id < len(request.block_ids_by_group):
+            return request.block_ids_by_group[group_id]
+        return request.block_ids
+
+    def _mooncake_key_group_id(self, key: str) -> int:
+        """Recover the owning KV cache group from a Mooncake block key."""
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(getattr(self, "grouped_block_size", [1]))
+        if num_groups <= 1:
+            return 0
+        parts = key.split("@")
+        if len(parts) >= 3 and parts[1].isdigit():
+            return int(parts[1])
+        if len(parts) >= 3:
+            match = re.search(r"_g(\d+)$", parts[1])
+            if match:
+                return int(match.group(1))
+        return 0
+
+    def _encode_mooncake_block_index(self, group_id: int, block_index: int) -> int:
+        """Make tracker block slots unique across KV cache groups.
+
+        The MooncakeSessionTracker keys its per-request entries by block
+        index. DSV4 groups use different block sizes, so the same local block
+        index appears in every group and would otherwise evict sibling group
+        entries. Single-group deployments keep the raw index unchanged.
+        """
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(getattr(self, "grouped_block_size", [1]))
+        if num_groups <= 1:
+            return block_index
+        return group_id * (1 << 20) + block_index
+
+    def _decode_mooncake_block_index(self, encoded_index: int) -> tuple[int, int]:
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(getattr(self, "grouped_block_size", [1]))
+        if num_groups <= 1:
+            return 0, encoded_index
+        return encoded_index // (1 << 20), encoded_index % (1 << 20)
+
+    def _prepare_mooncake_get_session(self, request: ReqMeta) -> list[tuple[str, int, int | None]]:
+        num_groups = getattr(self, "num_kv_cache_groups", None)
+        if num_groups is None:
+            num_groups = len(self.grouped_block_size)
+        request.load_block_keys_by_group = [[] for _ in range(num_groups)]
+        request.load_last_block_key_by_group = [None] * num_groups
+        request.load_key_block_offset_by_group = [0] * num_groups
+        request.load_keys = []
+        current_entries: list[tuple[str, int, int]] = []
+        load_spec = request.load_spec
+        if load_spec is not None and load_spec.can_load:
+            cached_tokens = load_spec.kvpool_cached_tokens
+            if not self.use_eagle and load_spec.kvpool_store_skip_tokens is not None:
+                cached_tokens = load_spec.kvpool_store_skip_tokens
+            for group_id in range(num_groups):
+                group_block_size = get_group_block_size(self.grouped_block_size, group_id)
+                group_block_ids = self._request_group_block_ids(request, group_id)
+                start_block = load_spec.vllm_cached_tokens // group_block_size
+                cached_full_blocks = cached_tokens // group_block_size
+                group_block_hashes = get_block_hashes(
+                    request.block_hashes,
+                    group_block_size,
+                    self.hash_block_size,
+                )
+                end_block = min(cached_full_blocks, len(group_block_hashes))
+                for block_index in range(start_block, end_block):
+                    current_entries.append(
+                        (
+                            make_layerwise_block_key(
+                                self.model_name,
+                                block_hash_to_str(group_block_hashes[block_index]),
+                                self.head_or_tp_rank,
+                                group_id=group_id,
+                                num_groups=num_groups,
+                            ),
+                            group_id,
+                            block_index,
+                        )
+                    )
+                needs_last_block = cached_tokens % group_block_size != 0 or (
+                    cached_tokens > 0 and end_block < cached_full_blocks
+                )
+                partial_block_index = cached_full_blocks if cached_tokens % group_block_size else cached_full_blocks - 1
+                if needs_last_block and 0 <= partial_block_index < len(group_block_ids):
+                    if num_groups > 1:
+                        partial_tag = f"{request.req_id}_lastblock_g{group_id}"
+                    else:
+                        partial_tag = f"{request.req_id}_lastblock"
+                    current_entries.append(
+                        (
+                            make_layerwise_block_key(
+                                self.model_name,
+                                partial_tag,
+                                self.head_or_tp_rank,
+                                group_id=group_id,
+                                num_groups=num_groups,
+                            ),
+                            group_id,
+                            partial_block_index,
+                        )
+                    )
+
+        load_entries = self._mooncake_session_tracker.prepare_load_entries(
+            request.req_id,
+            (
+                (key, self._encode_mooncake_block_index(group_id, block_index))
+                for key, group_id, block_index in current_entries
+            ),
+        )
+        entries_by_group: list[list[tuple[str, int]]] = [[] for _ in range(num_groups)]
+        for key, encoded_index in load_entries:
+            group_id, block_index = self._decode_mooncake_block_index(encoded_index)
+            if group_id >= num_groups:
+                group_id = self._mooncake_key_group_id(key)
+            entries_by_group[group_id].append((key, block_index))
+
+        key_slots: list[tuple[str, int, int | None]] = []
+        for group_id in range(num_groups):
+            group_block_ids = self._request_group_block_ids(request, group_id)
+            valid_entries = [
+                (key, block_index)
+                for key, block_index in entries_by_group[group_id]
+                if 0 <= block_index < len(group_block_ids)
+            ]
+            if not valid_entries:
+                continue
+            request.load_key_block_offset_by_group[group_id] = 0
+            max_block = max(block_index for _, block_index in valid_entries)
+            group_keys: list[str | None] = [None] * (max_block + 1)
+            request.load_block_keys_by_group[group_id] = group_keys
+            for key, block_index in valid_entries:
+                group_keys[block_index] = key
+                key_slots.append((key, group_block_ids[block_index], block_index))
+
+        if num_groups == 1:
+            request.load_key_block_offset = request.load_key_block_offset_by_group[0]
+            request.load_block_keys = request.load_block_keys_by_group[0]
+            request.load_last_block_key = request.load_last_block_key_by_group[0]
+        return key_slots
+
+    def _open_mooncake_get_sessions(self, request_key_slots: list[tuple[ReqMeta, str, int, int | None]]) -> None:
+        if not request_key_slots:
+            return
+        keys = list(dict.fromkeys(key for _, key, _, _ in request_key_slots))
+        request_ids_by_key: dict[str, set[str]] = {}
+        for request, key, _, _ in request_key_slots:
+            request_ids_by_key.setdefault(key, set()).add(request.req_id)
+        try:
+            results = self._start_mooncake_get_keys(keys)
+        except Exception as exc:
+            logger.error("Mooncake batch_get_start failed keys=%s error=%s", keys, exc)
+            self._release_failed_mooncake_get_attempts(request_ids_by_key)
+            for request, key, _, _ in request_key_slots:
+                self._clear_mooncake_load_key(request, key)
+            self._record_layerwise_invalid_blocks([block_id for _, _, block_id, _ in request_key_slots])
+            return
+
+        results_by_key = dict(zip(keys, results, strict=True))
+        for key, result in results_by_key.items():
+            self._mooncake_session_tracker.record_get_result(key, request_ids_by_key[key], succeeded=result == 0)
+        request_load_keys: dict[int, list[str]] = {}
+        request_seen_keys: dict[int, set[str]] = {}
+        requests_by_id: dict[int, ReqMeta] = {}
+        hybrid_failed_blocks: list[int] = []
+        for request, key, block_id, slot in request_key_slots:
+            request_identity = id(request)
+            requests_by_id[request_identity] = request
+            request_load_keys.setdefault(request_identity, [])
+            request_seen_keys.setdefault(request_identity, set())
+            if results_by_key[key] == 0:
+                if key not in request_seen_keys[request_identity]:
+                    request_load_keys[request_identity].append(key)
+                    request_seen_keys[request_identity].add(key)
+                continue
+            if self.num_kv_cache_groups > 1:
+                hybrid_failed_blocks.append(block_id)
+                continue
+            self._record_layerwise_invalid_blocks([block_id])
+            self._clear_mooncake_load_key(request, key)
+        for request_identity, request in requests_by_id.items():
+            request.load_keys = request_load_keys[request_identity]
+        if hybrid_failed_blocks:
+            self._end_mooncake_load_keys(keys)
+            raise RuntimeError(
+                "Layerwise multi-group KV load failed and cannot safely fall "
+                "back to per-block recomputation: "
+                f"failed_blocks={hybrid_failed_blocks}"
+            )
+
+    def _clear_mooncake_load_key(
+        self,
+        request: ReqMeta,
+        target_key: str,
+    ) -> None:
+        """Clear one failed get-session key from every per-group row set."""
+        for group_keys in request.load_block_keys_by_group:
+            for index, key in enumerate(group_keys):
+                if key == target_key:
+                    group_keys[index] = None
+                    break
+        if request.load_block_keys:
+            for index, key in enumerate(request.load_block_keys):
+                if key == target_key:
+                    request.load_block_keys[index] = None
+                    break
+        request.load_last_block_key_by_group = [
+            None if key == target_key else key for key in request.load_last_block_key_by_group
+        ]
+        if request.load_last_block_key == target_key:
+            request.load_last_block_key = None
+
+    def _prepare_mooncake_layerwise_sessions(self, requests: list[ReqMeta]) -> None:
+        self._layer_load_aborted.clear()
+        self._current_mooncake_request_ids = {request.req_id for request in requests}
+        self._current_mooncake_last_chunk_req_ids = {request.req_id for request in requests if request.is_last_chunk}
+        get_key_slots: list[tuple[ReqMeta, str, int, int | None]] = []
+        for request in requests:
+            get_key_slots.extend(
+                (request, key, block_id, slot) for key, block_id, slot in self._prepare_mooncake_get_session(request)
+            )
+        self._open_mooncake_get_sessions(get_key_slots)
+        for request in requests:
+            self._prepare_mooncake_put_session(request)
+
     def _build_shared_save_data(self) -> None:
         """Build shared block data once and attach to all layer save tasks.
 
@@ -1601,6 +2132,8 @@ class KVPoolWorker:
         # Worker threads may still own the lists from the preceding step.
         self.layer_save_tasks = [[] for _ in range(self.num_layers)]
         self.layer_load_tasks = [[] for _ in range(self.num_layers)]
+        if self.backend_name == "mooncake" and self.use_block_key_layerwise:
+            self._prepare_mooncake_layerwise_sessions(requests)
         for physical_layer in range(self.num_layers):
             group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, physical_layer)])
             for group_id, layer_idx_in_group in group_layers:
@@ -1624,7 +2157,11 @@ class KVPoolWorker:
             if not self.layer_load_tasks[layer_id] and reuse_source is None:
                 return False
             attention_start_gate = None
-            if self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
+            if (
+                self.layerwise_anchor == "attention"
+                and self.layer_load_tasks[layer_id]
+                and layer_id != self.current_layer
+            ):
                 attention_start_gate = get_attention_compute_start_gate()
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]
@@ -1636,7 +2173,12 @@ class KVPoolWorker:
             )
             return True
 
-        submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
+        # Keep exactly ``num_prefetch_layers`` loads in flight, but cap how many are
+        # released per call so the first layers ramp up instead of bursting every
+        # prefetch at once (which floods the shared SDMA engine used by collectives).
+        lead = self.next_layer_to_submit - self.current_layer
+        remaining = max(0, self.num_prefetch_layers - lead)
+        submit_count = min(remaining, self.layerwise_prefetch_ramp)
         submitted_layers = 0
         while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
             layer_id = self.next_layer_to_submit
@@ -1649,19 +2191,35 @@ class KVPoolWorker:
             return
         assert self.layer_load_finished_events is not None
         assert self.kv_recv_thread is not None
-        self.kv_recv_thread.raise_if_failed()
-        reset_attention_compute_start_gate()
-        self._submit_ready_layer_loads()
-        should_wait = bool(self.layer_load_tasks[self.current_layer]) or self.current_layer in self.prefetch_layer_map
-        if not should_wait:
-            self.layer_load_finished_events[self.current_layer].clear()
-            if self.external_slot_release_waiter is not None:
-                self.external_slot_release_waiter(self.current_layer)
-            return
-        while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
+        try:
             self.kv_recv_thread.raise_if_failed()
-            logger.info("Layerwise %d load not done, keep waiting", self.current_layer)
+            reset_attention_compute_start_gate()
+            self._submit_ready_layer_loads()
+            should_wait = (
+                bool(self.layer_load_tasks[self.current_layer]) or self.current_layer in self.prefetch_layer_map
+            )
+            if should_wait:
+                while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
+                    self.kv_recv_thread.raise_if_failed()
+                    logger.info("Layerwise %d load not done, keep waiting", self.current_layer)
+                self.kv_recv_thread.raise_if_failed()
+            elif self.external_slot_release_waiter is not None:
+                self.external_slot_release_waiter(self.current_layer)
+        except Exception:
+            if hasattr(self, "_layer_load_aborted"):
+                self._layer_load_aborted.set()
+            if getattr(self, "backend_name", None) == "mooncake" and getattr(self, "use_block_key_layerwise", False):
+                self._finish_current_mooncake_load_sessions()
+            raise
         self.layer_load_finished_events[self.current_layer].clear()
+        if (
+            getattr(self, "backend_name", None) == "mooncake"
+            and getattr(self, "use_block_key_layerwise", False)
+            and (self._layer_load_aborted.is_set() or self.current_layer == self.num_layers - 1)
+        ):
+            self._finish_current_mooncake_load_sessions()
+        if hasattr(self, "kv_role") and not is_kv_save_role(self.kv_role, getattr(self, "consumer_is_to_put", False)):
+            self.current_layer += 1
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._invalid_block_ids_lock:
@@ -1689,6 +2247,7 @@ class KVPoolWorker:
             while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10):
                 send_thread.raise_if_failed()
                 logger.info("Layerwise %d save not done, keep waiting", self.current_layer)
+            send_thread.raise_if_failed()
             reuse_source_layers = set(self.prefetch_layer_map.values())
             for layer_id in range(self.num_layers):
                 if layer_id in reuse_source_layers:
@@ -2024,6 +2583,8 @@ class KVPoolWorker:
             send_thread.dec_stored_request(req_id)  # type: ignore[attr-defined]
 
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
+        if self.backend_name == "mooncake" and self.use_block_key_layerwise:
+            self._release_mooncake_requests_terminal(finished_req_ids | meta.preempted_req_ids)
         if self.kv_send_thread is not None:
             send_thread = self.kv_send_thread
             for req_id in meta.preempted_req_ids:
