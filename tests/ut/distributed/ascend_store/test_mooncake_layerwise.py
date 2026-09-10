@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 import threading
 import types
 import unittest
@@ -28,6 +29,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVTransferThread,
     LayerBatchBuilder,
     _build_range_debug_payload,
+    _layer_diag_enabled,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ChunkedTokenDatabase,
@@ -361,6 +363,104 @@ class TestMooncakeRangeMultiGroupBatchedTransfer(unittest.TestCase):
         thread._handle_request(data)
         # One batched get covering both groups per physical layer.
         self.assertEqual(store.batch_copy_get.call_count, 1)
+
+    @staticmethod
+    def _diag_payloads(emit) -> list[dict]:
+        return [call.args[0] for call in emit.call_args_list]
+
+    def _run_multigroup_load(self, thread) -> None:
+        data = LayerLoadTask(
+            wait_for_save_layer=None,
+            transfer_tasks=[
+                LayerTransferTask(
+                    layer_id=0,
+                    block_ranges=[],
+                    group_id=0,
+                    layer_idx_in_group=0,
+                    shared_block_data=MagicMock(),
+                    use_key_major_ranges=True,
+                ),
+                LayerTransferTask(
+                    layer_id=0,
+                    block_ranges=[],
+                    group_id=1,
+                    layer_idx_in_group=0,
+                    shared_block_data=MagicMock(),
+                    use_key_major_ranges=True,
+                ),
+            ],
+            layer_id=0,
+            submit_ts=123.0,
+        )
+        thread.request_queue.put(data)
+        thread._handle_request(data)
+
+    def _make_diag_thread(self):
+        store = MagicMock()
+        store.batch_copy_get.return_value = [0, 0]
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[threading.Event()] * 3,
+            layer_save_finished_events=[threading.Event()] * 3,
+            sync_save_events=[MagicMock()] * 3,
+            num_layers=3,
+            num_kv_cache_groups=2,
+            group_builders=[
+                _FakeRangeBuilder(0, num_layers=1),
+                _FakeRangeBuilder(1, num_layers=2),
+            ],
+        )
+        return thread
+
+    def test_layer_diag_emits_load_attribution_when_enabled(self):
+        thread = self._make_diag_thread()
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer._layer_diag_enabled",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer._emit_layer_diag"
+            ) as emit,
+        ):
+            self._run_multigroup_load(thread)
+        payloads = self._diag_payloads(emit)
+        load_payloads = [p for p in payloads if p.get("event") == "load"]
+        self.assertEqual(len(load_payloads), 1)
+        self.assertEqual(load_payloads[0]["groups"], [0, 1])
+        self.assertEqual(load_payloads[0]["keys_per_group"], [1, 1])
+        self.assertEqual(load_payloads[0]["keys_total"], 2)
+        self.assertEqual(load_payloads[0]["fragments"], 2)
+        self.assertEqual(load_payloads[0]["batches"], 1)
+        self.assertTrue(any(p.get("event") == "timing" for p in payloads))
+
+    def test_layer_diag_is_silent_when_disabled(self):
+        thread = self._make_diag_thread()
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer._layer_diag_enabled",
+                return_value=False,
+            ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer._emit_layer_diag"
+            ) as emit,
+        ):
+            self._run_multigroup_load(thread)
+        self.assertEqual(self._diag_payloads(emit), [])
+
+    def test_layer_diag_flag_reads_env(self):
+        with patch.dict(os.environ, {"VLLM_ASCEND_KVPOOL_LAYER_DIAG": "1"}):
+            self.assertTrue(_layer_diag_enabled())
+        with patch.dict(os.environ, {"VLLM_ASCEND_KVPOOL_LAYER_DIAG": "0"}):
+            self.assertFalse(_layer_diag_enabled())
 
 
 class TestMooncakePrefetchAnchoring(unittest.TestCase):

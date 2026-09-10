@@ -1264,6 +1264,9 @@ class LayerLoadTask:
     transfer_tasks: list[LayerTransferTask]
     layer_id: int
     attention_start_gate: AttentionComputeStartGate | None = None
+    # Host perf_counter when the task was submitted; used only by the
+    # KVPOOL_LAYER_DIAG experiment to measure submit -> gate -> done latency.
+    submit_ts: float | None = None
 
 
 @dataclass(init=False)

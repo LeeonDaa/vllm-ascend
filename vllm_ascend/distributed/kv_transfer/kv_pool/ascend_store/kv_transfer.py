@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import queue
 import threading
 import time
@@ -92,6 +93,28 @@ def _emit_commit_debug_event(layer_id: int, key_count: int, results: list[int]) 
         }
         logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
     except Exception:
+        pass
+
+
+# Experiment-only per-layer attribution for multi-group Mooncake layerwise
+# (VLLM_ASCEND_KVPOOL_LAYER_DIAG=1). Off by default; never touches the transfer path.
+_KVPOOL_LAYER_DIAG_PREFIX = "[KVPOOL_LAYER_DIAG]"
+
+
+def _layer_diag_enabled() -> bool:
+    try:
+        return os.getenv("VLLM_ASCEND_KVPOOL_LAYER_DIAG", "0") == "1"
+    except Exception:
+        return False
+
+
+def _emit_layer_diag(payload: dict[str, Any]) -> None:
+    try:
+        if not _layer_diag_enabled():
+            return
+        logger.info("%s %s", _KVPOOL_LAYER_DIAG_PREFIX, json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        # Diagnostic instrumentation must never affect the transfer path.
         pass
 
 
@@ -1798,18 +1821,37 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 all_sizes.append(req_meta.all_sizes[index])
                 all_offsets.append(req_meta.all_offsets[index])
 
-        if active_keys:
-            # One compute-stream sync per physical layer (was one per group per layer).
-            self.sync_save_events[layer_id].synchronize()
-            results: list[int] = []
-            for keys, buffers, sizes, offsets in self._range_transfer_batches(
+        diag_batches = (
+            self._range_transfer_batches(
                 active_keys,
                 all_buffers,
                 all_sizes,
                 all_offsets,
                 self.max_transfer_blocks,
                 self.max_transfer_bytes,
-            ):
+            )
+            if active_keys
+            else []
+        )
+        if _layer_diag_enabled():
+            _emit_layer_diag(
+                {
+                    "event": "save",
+                    "layer_id": int(layer_id),
+                    "keys_per_group": [len(req_meta.keys) for req_meta, _commit in metas],
+                    "keys_total": len(active_keys),
+                    "fragments": sum(len(row) for row in all_buffers),
+                    "batches": len(diag_batches),
+                    "commit_groups": [int(_commit) for _req_meta, _commit in metas],
+                    "max_transfer_blocks": int(self.max_transfer_blocks),
+                    "max_transfer_bytes": int(self.max_transfer_bytes),
+                }
+            )
+        if active_keys:
+            # One compute-stream sync per physical layer (was one per group per layer).
+            self.sync_save_events[layer_id].synchronize()
+            results: list[int] = []
+            for keys, buffers, sizes, offsets in diag_batches:
                 results.extend(
                     require_aligned_batch_results(
                         "batch_copy_put",
@@ -2078,6 +2120,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
     def _handle_range_layer_task(self, data: LayerLoadTask) -> None:
         layer_id = data.layer_id
+        issue_ts: float | None = None
         try:
             wait_for_save = data.wait_for_save_layer
             if wait_for_save is not None:
@@ -2093,6 +2136,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             if data.attention_start_gate is not None:
                 while not data.attention_start_gate.wait(timeout=10):
                     logger.info("Layerwise %d load waits for attention compute start", layer_id)
+            issue_ts = time.perf_counter()
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
             if self.num_kv_cache_groups > 1:
@@ -2118,6 +2162,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self._load_abort_event.set()
             raise
         finally:
+            if _layer_diag_enabled() and data.submit_ts is not None and issue_ts is not None:
+                _emit_layer_diag(
+                    {
+                        "event": "timing",
+                        "layer_id": int(layer_id),
+                        "gated": data.attention_start_gate is not None,
+                        "waited_for_save": data.wait_for_save_layer,
+                        "submit_to_issue_ms": round((issue_ts - data.submit_ts) * 1000, 3),
+                        "issue_to_done_ms": round((time.perf_counter() - issue_ts) * 1000, 3),
+                    }
+                )
             if not self.layer_load_finished_events[layer_id].is_set():
                 self.layer_load_finished_events[layer_id].set()
             self.request_queue.task_done()
@@ -2174,16 +2229,40 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 all_sizes.append(req_meta.all_sizes[index])
                 all_offsets.append(req_meta.all_offsets[index])
 
-        if active_keys:
-            results: list[int] = []
-            for keys, buffers, sizes, offsets in self._range_transfer_batches(
+        diag_batches = (
+            self._range_transfer_batches(
                 active_keys,
                 all_buffers,
                 all_sizes,
                 all_offsets,
                 self.max_transfer_blocks,
                 self.max_transfer_bytes,
-            ):
+            )
+            if active_keys
+            else []
+        )
+        if _layer_diag_enabled():
+            _emit_layer_diag(
+                {
+                    "event": "load",
+                    "layer_id": int(layer_id),
+                    "groups": [int(task.group_id) for task in transfer_tasks],
+                    "keys_per_group": [len(req_meta.keys) for req_meta in metas],
+                    "keys_total": len(active_keys),
+                    "rows_per_group": [len(req_meta.all_buffers) for req_meta in metas],
+                    "slices_per_row": [
+                        len(req_meta.all_buffers[0]) if req_meta.all_buffers else 0 for req_meta in metas
+                    ],
+                    "fragments": sum(len(row) for row in all_buffers),
+                    "batches": len(diag_batches),
+                    "max_transfer_blocks": int(self.max_transfer_blocks),
+                    "max_transfer_bytes": int(self.max_transfer_bytes),
+                    "req_ids": list(dict.fromkeys(req_id for req_meta in metas for req_id in req_meta.req_ids))[:4],
+                }
+            )
+        if active_keys:
+            results: list[int] = []
+            for keys, buffers, sizes, offsets in diag_batches:
                 results.extend(
                     require_aligned_batch_results(
                         "batch_copy_get",

@@ -2169,6 +2169,7 @@ class KVPoolWorker:
                     transfer_tasks=self.layer_load_tasks[layer_id],
                     layer_id=layer_id,
                     attention_start_gate=attention_start_gate,
+                    submit_ts=time.perf_counter(),
                 )
             )
             return True
