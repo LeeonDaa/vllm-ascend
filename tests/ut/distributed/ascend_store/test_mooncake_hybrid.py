@@ -307,6 +307,8 @@ class TestMooncakeHybrid(unittest.TestCase):
         scheduler.model_name = "model"
         scheduler.tp_size = 2
         scheduler.put_step = 1
+        scheduler.pp_size = 1
+        scheduler.dcp_size = 1
         scheduler.grouped_block_size = [16, 32]
         scheduler.layerwise_max_transfer_blocks = 1
         scheduler.store_scheduler = MagicMock()
@@ -323,7 +325,7 @@ class TestMooncakeHybrid(unittest.TestCase):
         self.assertEqual(scheduler._lookup_layerwise_with_coordinator(req, 32), 0)
         scheduler.store_scheduler.batch_get_key_info.assert_not_called()
         keys = scheduler.store_scheduler.batch_is_exist.call_args_list[0].args[0]
-        self.assertEqual(keys[0], "model@mooncake_hybrid_v1:layout@group:0@block:16@6831@0")
+        self.assertEqual(keys[0], "model@mooncake_hybrid_v1:layout@pp_rank:0@dcp_rank:0@group:0@block:16@6831@0")
 
     def save_prefix(self, worker, last_chunk=True):
         request = ReqMeta(
