@@ -94,6 +94,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # Emit per-layer multi-group Mooncake layerwise attribution events
+    # (hit check, put session, copy timing). Default: 0 (disabled).
+    # Valid values: 0 or 1. This configuration is not sensitive.
+    "VLLM_ASCEND_KVPOOL_LAYER_DIAG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_LAYER_DIAG"),
 }
 
 # end-env-vars-definition

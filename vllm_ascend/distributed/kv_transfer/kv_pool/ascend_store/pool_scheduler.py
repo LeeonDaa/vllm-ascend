@@ -67,7 +67,7 @@ class KVPoolScheduler:
         self.use_layerwise = use_layerwise
         # Per-group pooled prefix from the most recent Mooncake layerwise hit
         # check; consumed when building the LoadSpec for the save path.
-        self._layerwise_hits_per_group: list[int] | None = None
+        self._layerwise_hits_per_group: dict[int, int] | None = None
         self.kv_cache_config = kv_cache_config
         hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
         hf_config = getattr(vllm_config.model_config, "hf_config", hf_text_config)
@@ -425,7 +425,7 @@ class KVPoolScheduler:
         head_or_tp_ranks = self.tp_size // self.put_step
         group_ids = self.kv_cache_group_ids if self.use_hybrid else [0]
         num_groups = len(self.grouped_block_size)
-        hits_per_group: list[int] = []
+        hits_per_group: dict[int, int] = {}
         for group_id in group_ids:
             effective_block_size = get_group_block_size(self.grouped_block_size, group_id)
             block_hashes = get_block_hashes(
@@ -434,7 +434,7 @@ class KVPoolScheduler:
                 self.hash_block_size,
             )
             if not block_hashes:
-                hits_per_group.append(0)
+                hits_per_group[group_id] = 0
                 continue
             keys_by_block = [
                 [
@@ -479,17 +479,17 @@ class KVPoolScheduler:
                 if not all(result == 1 for result in block_results):
                     break
                 num_hit_blocks += 1
-            hits_per_group.append(num_hit_blocks * effective_block_size)
+            hits_per_group[group_id] = num_hit_blocks * effective_block_size
         if not hits_per_group:
             self._layerwise_hits_per_group = None
             return 0
         logger.info(
             "Mooncake layerwise hit check request=%s hits_per_group=%s",
             request.request_id,
-            hits_per_group,
+            sorted(hits_per_group.items()),
         )
-        self._layerwise_hits_per_group = list(hits_per_group)
-        return min(hits_per_group)
+        self._layerwise_hits_per_group = dict(hits_per_group)
+        return min(hits_per_group.values())
 
     def _get_block_key_layerwise_hit_tokens(
         self,

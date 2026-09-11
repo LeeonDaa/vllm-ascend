@@ -774,8 +774,9 @@ class LoadSpec:
     kvpool_store_skip_tokens: int | None = None
     # Per KV-cache-group pooled prefix. A group can be pooled further than the
     # min-over-groups mask, so the save path uses this to avoid re-putting
-    # already pooled objects. None for single-group / non-mooncake paths.
-    kvpool_hits_per_group: list[int] | None = None
+    # already pooled objects. Keyed by KV cache group id (group ids are not
+    # guaranteed to be contiguous). None for single-group / non-mooncake paths.
+    kvpool_hits_per_group: dict[int, int] | None = None
 
     token_len: int = 0
 

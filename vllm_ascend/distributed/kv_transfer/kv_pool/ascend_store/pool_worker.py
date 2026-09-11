@@ -1714,6 +1714,53 @@ class KVPoolWorker:
         self._current_mooncake_request_ids.difference_update(req_ids)
         self._current_mooncake_last_chunk_req_ids.difference_update(req_ids)
 
+    def _emit_put_session_diag(
+        self,
+        *,
+        request: ReqMeta,
+        group_id: int,
+        start_block: int,
+        end_block: int,
+        store_skip_tokens: int,
+        pool_hit_tokens: int,
+        has_load_spec: bool,
+        keys_total: int,
+        new_keys_count: int,
+        newly_started_count: int,
+        already_existing_count: int,
+        put_start_ms: float,
+    ) -> None:
+        """Emit one ``put_session`` audit line for a single KV cache group.
+
+        ``store_skip_tokens``/``pool_hit_tokens`` are zero whenever the chunk
+        carries no LoadSpec (chunked-prefill continuations and decode steps),
+        so ``has_load_spec`` disambiguates "no pooled prefix" from "no hit
+        check happened at all"; ``skipped_pooled_prefix`` marks the case where
+        the pooled prefix covered the whole chunk and no session was opened.
+        """
+        if not _layer_diag_enabled():
+            return
+        _emit_layer_diag(
+            {
+                "event": "put_session",
+                "req_ids": [request.req_id],
+                "group_id": int(group_id),
+                "save_start_token": int(request.save_start_token),
+                "save_end_token": int(request.save_end_token),
+                "start_block": int(start_block),
+                "end_block": int(end_block),
+                "has_load_spec": bool(has_load_spec),
+                "skipped_pooled_prefix": bool(not keys_total and pool_hit_tokens > 0),
+                "pool_hit_tokens": int(pool_hit_tokens),
+                "store_skip_tokens": int(store_skip_tokens),
+                "keys_total": int(keys_total),
+                "new_keys": int(new_keys_count),
+                "newly_started": int(newly_started_count),
+                "already_existing": int(already_existing_count),
+                "put_start_ms": put_start_ms,
+            }
+        )
+
     def _prepare_mooncake_put_session(self, request: ReqMeta) -> None:
         num_groups = getattr(self, "num_kv_cache_groups", None)
         if num_groups is None:
@@ -1729,6 +1776,7 @@ class KVPoolWorker:
             end_block = request.save_end_token // group_block_size
             store_skip_tokens = 0
             pool_hit_tokens = 0
+            has_load_spec = request.load_spec is not None and request.load_spec.can_load
             if request.load_spec is not None and request.load_spec.can_load:
                 store_skip_tokens = (
                     request.load_spec.kvpool_store_skip_tokens
@@ -1737,11 +1785,13 @@ class KVPoolWorker:
                 )
                 pool_hit_tokens = store_skip_tokens
                 per_group_hits = getattr(request.load_spec, "kvpool_hits_per_group", None)
-                if per_group_hits is not None and group_id < len(per_group_hits):
+                if isinstance(per_group_hits, dict):
                     # A KV group can be pooled beyond the min-over-groups mask;
                     # start this group's save at its own prefix so already pooled
                     # objects are not re-put.
-                    pool_hit_tokens = max(pool_hit_tokens, per_group_hits[group_id])
+                    group_hit = per_group_hits.get(group_id)
+                    if group_hit is not None:
+                        pool_hit_tokens = max(pool_hit_tokens, group_hit)
                 start_block = max(start_block, pool_hit_tokens // group_block_size)
             group_block_hashes = get_block_hashes(
                 request.block_hashes,
@@ -1782,6 +1832,20 @@ class KVPoolWorker:
 
             requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
             if not requested_keys:
+                self._emit_put_session_diag(
+                    request=request,
+                    group_id=group_id,
+                    start_block=start_block,
+                    end_block=end_block,
+                    store_skip_tokens=store_skip_tokens,
+                    pool_hit_tokens=pool_hit_tokens,
+                    has_load_spec=has_load_spec,
+                    keys_total=0,
+                    new_keys_count=0,
+                    newly_started_count=0,
+                    already_existing_count=0,
+                    put_start_ms=0.0,
+                )
                 continue
             with self._put_started_keys_lock:
                 previously_started = set(requested_keys) & self._put_started_keys
@@ -1822,23 +1886,20 @@ class KVPoolWorker:
                         self._put_started_keys.update(newly_started)
                     started.update(newly_started)
 
-            if _layer_diag_enabled():
-                _emit_layer_diag(
-                    {
-                        "event": "put_session",
-                        "req_ids": [request.req_id],
-                        "group_id": int(group_id),
-                        "start_block": int(start_block),
-                        "end_block": int(end_block),
-                        "pool_hit_tokens": int(pool_hit_tokens),
-                        "store_skip_tokens": int(store_skip_tokens),
-                        "keys_total": len(requested_keys),
-                        "new_keys": len(new_keys),
-                        "newly_started": newly_started_count,
-                        "already_existing": already_existing_count,
-                        "put_start_ms": put_start_ms,
-                    }
-                )
+            self._emit_put_session_diag(
+                request=request,
+                group_id=group_id,
+                start_block=start_block,
+                end_block=end_block,
+                store_skip_tokens=store_skip_tokens,
+                pool_hit_tokens=pool_hit_tokens,
+                has_load_spec=has_load_spec,
+                keys_total=len(requested_keys),
+                new_keys_count=len(new_keys),
+                newly_started_count=newly_started_count,
+                already_existing_count=already_existing_count,
+                put_start_ms=put_start_ms,
+            )
 
             for key, slot, _ in key_slots:
                 if key in started:

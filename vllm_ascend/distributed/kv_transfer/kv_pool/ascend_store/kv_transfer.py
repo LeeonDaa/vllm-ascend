@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ctypes
 import json
-import os
 import queue
 import threading
 import time
@@ -103,7 +102,7 @@ _KVPOOL_LAYER_DIAG_PREFIX = "[KVPOOL_LAYER_DIAG]"
 
 def _layer_diag_enabled() -> bool:
     try:
-        return os.getenv("VLLM_ASCEND_KVPOOL_LAYER_DIAG", "0") == "1"
+        return bool(envs.VLLM_ASCEND_KVPOOL_LAYER_DIAG)
     except Exception:
         return False
 
@@ -1604,7 +1603,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self._put_started_keys_lock = put_started_keys_lock or threading.Lock()
         self._session_tracker = session_tracker
         self._active_put_keys: set[str] | None = None
+        # Keys whose put session was revoked, plus the KV cache group that owns
+        # them. A group's revoked keys are released only when that group commits,
+        # so a failing group can never be unblocked by a sibling group's commit.
         self._revoked_put_keys: set[str] = set()
+        self._revoked_put_key_groups: dict[str, int] = {}
         self.num_kv_cache_groups = num_kv_cache_groups
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
         if group_builders is not None:
@@ -1654,7 +1657,34 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if self._session_tracker is not None:
                 self._session_tracker.revoke_put_keys(keys)
 
-    def _handle_range_request(self, req_meta: LayerRangeReqMeta, commit_group: bool = False) -> None:
+    def _mark_revoked_put_keys(self, keys: list[str], group_id: int) -> None:
+        """Block revoked keys from further writes until their group commits."""
+        for key in keys:
+            self._revoked_put_keys.add(key)
+            self._revoked_put_key_groups[key] = group_id
+
+    def _release_revoked_put_keys(self, group_id: int) -> None:
+        """Release the revoked keys owned by one group after that group committed."""
+        owned = [key for key, owner in self._revoked_put_key_groups.items() if owner == group_id]
+        for key in owned:
+            self._revoked_put_keys.discard(key)
+            del self._revoked_put_key_groups[key]
+
+    def _range_key_group_id(self, key: str) -> int:
+        """Recover the owning group of a range key for keys revoked outside a task."""
+        if self.num_kv_cache_groups <= 1:
+            return 0
+        parts = key.split("@")
+        if len(parts) >= 2 and parts[1].isdigit():
+            return int(parts[1])
+        return 0
+
+    def _handle_range_request(
+        self,
+        req_meta: LayerRangeReqMeta,
+        commit_group: bool = False,
+        group_id: int = 0,
+    ) -> None:
         layer_id = req_meta.layer_id
         active_indices = [index for index, key in enumerate(req_meta.keys) if key not in self._revoked_put_keys]
         active_keys = [req_meta.keys[index] for index in active_indices]
@@ -1683,12 +1713,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:
                 self._revoke_range_keys(failed_keys)
-                self._revoked_put_keys.update(failed_keys)
+                self._mark_revoked_put_keys(failed_keys, group_id)
 
         if not commit_group:
             return
         self._commit_range_meta(req_meta)
-        self._revoked_put_keys.clear()
+        self._release_revoked_put_keys(group_id)
 
     def _commit_range_meta(self, req_meta: LayerRangeReqMeta) -> None:
         """Commit one group's range-session object once its final layer is written."""
@@ -1738,7 +1768,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 # this can happen earlier than the global final layer (e.g.
                 # when a trailing MTP layer is covered by another group).
                 commit_group = task.layer_idx_in_group == builder.num_layers - 1
-                self._handle_range_request(req_meta, commit_group=commit_group)
+                self._handle_range_request(req_meta, commit_group=commit_group, group_id=task.group_id)
                 processed_meta.append(req_meta)
                 for req_id in req_meta.req_ids:
                     self.dec_stored_request(req_id)
@@ -1752,7 +1782,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 )
             )
             self._revoke_range_keys(keys_to_revoke)
-            self._revoked_put_keys.update(keys_to_revoke)
+            for key in keys_to_revoke:
+                self._mark_revoked_put_keys([key], self._range_key_group_id(key))
             raise
         finally:
             if not self.layer_save_finished_events[layer_id].is_set():
@@ -1788,7 +1819,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         changing the KV payload or the per-group commit semantics. Single-group models
         keep the original per-task path untouched.
         """
-        metas: list[tuple[LayerRangeReqMeta, bool]] = []
+        metas: list[tuple[LayerRangeReqMeta, bool, int]] = []
         for task in transfer_tasks:
             if task.layer_id != layer_id:
                 raise ValueError(
@@ -1803,20 +1834,22 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if not isinstance(req_meta, LayerRangeReqMeta):
                 raise TypeError(f"Expected Mooncake range metadata, got {type(req_meta).__name__}")
             commit_group = task.layer_idx_in_group == builder.num_layers - 1
-            metas.append((req_meta, commit_group))
+            metas.append((req_meta, commit_group, task.group_id))
 
         if not metas:
             return
 
         active_keys: list[str] = []
+        active_key_groups: list[int] = []
         all_buffers: list[list[int]] = []
         all_sizes: list[list[int]] = []
         all_offsets: list[list[int]] = []
-        for req_meta, _commit_group in metas:
+        for req_meta, _commit_group, group_id in metas:
             for index, key in enumerate(req_meta.keys):
                 if key in self._revoked_put_keys:
                     continue
                 active_keys.append(key)
+                active_key_groups.append(group_id)
                 all_buffers.append(req_meta.all_buffers[index])
                 all_sizes.append(req_meta.all_sizes[index])
                 all_offsets.append(req_meta.all_offsets[index])
@@ -1839,11 +1872,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     "event": "save",
                     "ts": time.perf_counter(),
                     "layer_id": int(layer_id),
-                    "keys_per_group": [len(req_meta.keys) for req_meta, _commit in metas],
+                    "keys_per_group": [len(req_meta.keys) for req_meta, _commit, _group in metas],
                     "keys_total": len(active_keys),
                     "fragments": sum(len(row) for row in all_buffers),
                     "batches": len(diag_batches),
-                    "commit_groups": [int(_commit) for _req_meta, _commit in metas],
+                    "commit_groups": [int(_commit) for _req_meta, _commit, _group in metas],
                     "max_transfer_blocks": int(self.max_transfer_blocks),
                     "max_transfer_bytes": int(self.max_transfer_bytes),
                 }
@@ -1867,10 +1900,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 )
                 save_batch_ms.append(round((time.perf_counter() - batch_start) * 1000, 3))
             _emit_range_debug_event("save", layer_id, all_sizes, all_offsets, results)
-            failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
-            if failed_keys:
-                self._revoke_range_keys(failed_keys)
-                self._revoked_put_keys.update(failed_keys)
+            failed = [
+                (key, owner)
+                for key, owner, result in zip(active_keys, active_key_groups, results, strict=True)
+                if result < 0
+            ]
+            if failed:
+                self._revoke_range_keys([key for key, _owner in failed])
+                for key, owner in failed:
+                    self._mark_revoked_put_keys([key], owner)
 
         if _layer_diag_enabled():
             _emit_layer_diag(
@@ -1883,17 +1921,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     "batch_ms": save_batch_ms,
                 }
             )
-        for req_meta, commit_group in metas:
+        for req_meta, commit_group, group_id in metas:
             if commit_group:
                 self._commit_range_meta(req_meta)
+                # Only this group's revoked keys are released; a sibling group
+                # that committed in the same layer must not unblock them.
+                self._release_revoked_put_keys(group_id)
             processed_meta.append(req_meta)
             for req_id in req_meta.req_ids:
                 self.dec_stored_request(req_id)
-        # Match the per-group path: revoked keys are only cleared once a group in
-        # this layer commits, so a group that is not yet at its final layer keeps
-        # its previously revoked keys out of the next layer's write.
-        if any(commit_group for _req_meta, commit_group in metas):
-            self._revoked_put_keys.clear()
 
     def _handle_request(  # type: ignore[override]
         self, request: list[LayerTransferTask] | _LayerRevokeTask

@@ -81,13 +81,40 @@ Python 组装耗时；`copy_ms`/`batch_ms` = 实际 `batch_copy_get` 耗时；`s
 ## save 端“重写已存在对象”诊断与修法
 
 - 新增 diag 事件 `[KVPOOL_LAYER_DIAG] {"event":"put_session", ...}`：每组打印
-  `start_block / end_block / pool_hit_tokens / store_skip_tokens / keys_total / new_keys /
+  `save_start_token / save_end_token / start_block / end_block / has_load_spec /
+  skipped_pooled_prefix / pool_hit_tokens / store_skip_tokens / keys_total / new_keys /
   newly_started / already_existing / put_start_ms`。
   `already_existing > 0` 即“对已存在对象发起了 put_session_start”；`put_start_ms` 是该 RPC 耗时。
-- 根因：save 起跳原用 **min-over-groups 命中**（`store_skip_tokens`），而各组自身池化前缀可能更长 →
-  `[min, 本组自身命中)` 段被重复 put（master `object_already_exists`）。
-- **修法 A（默认生效）**：scheduler 的 `hits_per_group` 透传到 `LoadSpec.kvpool_hits_per_group`，
+- **修法 A（默认生效）**：scheduler 的 `hits_per_group`（`{group_id: tokens}`，按 group id 取值，
+  不假设 group id 连续）透传到 `LoadSpec.kvpool_hits_per_group`，
   `_prepare_mooncake_put_session` 对**每组**用本组自身命中作为 save 起跳。缺省为 None 时行为不变。
 - **修法 B（可选兜底）**：`layerwise_put_exists_filter=true` 时，put_session_start 前先用
   `batch_is_exist` 过滤已存在 key。
-- 验收：master `object_already_exists` 显著下降；尖峰层 `dsa_ms` 回落；`put_start_ms` 不再大额阻塞。
+
+**读日志的两个坑（2026-09-11 更正）**
+
+1. `store_skip_tokens=0` **不等于**“修法 A 未生效”。LoadSpec 只在 new request 首次调度时构建，
+   chunked-prefill 的后续 chunk 走 `_process_running_cached_request`，本来就没有 LoadSpec
+   （`metadata.py` 的 `from_request_tracker` 在 `can_load` 为假时把 load_spec 置 None），
+   所以运行中 chunk 的 `store_skip_tokens/pool_hit_tokens` 恒为 0。请用
+   `has_load_spec` 区分“没有命中检查”与“命中为 0”。
+2. `if not requested_keys: continue` 在 diag 打印之前，会出现“整段都命中、键集为空、
+   因此看不到该层 put_session 行”的情况。现在这种整段跳过会打印
+   `keys_total=0 / skipped_pooled_prefix=true` 的事件。
+
+**“重写已池化前缀”的结论修正**：在 `exp_logs/new_log1.md`（`chatcmpl-94a01242`，
+`hits_per_group=[8192]*6`）里，该请求 12 条 `put_session` 的 `start_block` 恰好等于
+`8192 / group_block_size`，**没有任何 start_block=0 的行**，即 0–8192 的池化前缀已被跳过；
+`already_existing` 落在 8192–16384，是该 chunk 自己的新区间（90% 命中基准下前缀共享，
+被并发请求写过）。修法 A 仍然有价值，但只在各组命中不齐（min-over-groups 欠跳）时生效，
+收益量级是每 chunk 约 40ms 的 `batch_put_start` RPC——KV payload 本来就没有重复搬运。
+- 验收（修正后）：各组命中不齐时 `[min, 本组自身命中)` 段不再 put；master
+  `object_already_exists` 只统计“本请求写入区间内的重复”；不以“chunk1 already_existing → 0”为准。
+
+## 跨组 revoke 清理（2026-09-11 修复）
+
+多组 save 过去在“本层有**任一**组 commit”时清空共享的 `_revoked_put_keys`。当一层里出现
+`commit_groups=[1,0,1]` 这类不均齐提交流水（`exp_logs/new_log1.md` 实测存在）时，某一组因
+`batch_copy_put` 失败被 revoke 的 key 会被兄弟组的 commit 提前解除标记，存在提交“只写了部分层”
+对象的静默数据损坏风险。现在 revoked key 按 group 记录（`_revoked_put_key_groups`），
+**只有拥有它的组 commit 时才释放**；单组路径行为不变。

@@ -157,6 +157,31 @@ class TestKVPoolScheduler(unittest.TestCase):
             ],
         )
 
+    def test_mooncake_layerwise_hits_are_keyed_by_group_id(self):
+        """Per-group hits must be keyed by group id, not by list position."""
+        scheduler = KVPoolScheduler(
+            self._make_config(extra_config={"backend": "mooncake", "use_layerwise": True}),
+            use_layerwise=True,
+        )
+        scheduler.kv_cache_group_ids = [0, 2]
+        scheduler.grouped_block_size = [16, 8, 8]
+        scheduler.hash_block_size = 8
+        scheduler.use_hybrid = True
+        scheduler._block_size = 16
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1],
+            [1, 1, 1, 0],
+        ]
+        request = MagicMock(
+            request_id="r1",
+            block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+        )
+
+        hit_tokens = scheduler._get_mooncake_layerwise_hit_tokens(request, 32, 0)
+
+        self.assertEqual(hit_tokens, 24)
+        self.assertEqual(scheduler._layerwise_hits_per_group, {0: 32, 2: 24})
+
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_hit(self, mock_client_cls):
         request = MagicMock(
@@ -433,6 +458,51 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
 
         meta = scheduler.build_connector_meta(sched_output)
         self.assertTrue(len(meta.requests) >= 1)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_mooncake_save_meta_carries_per_group_pooled_prefix(self, mock_client_cls):
+        """The per-group pooled prefix has to survive into the save-side ReqMeta."""
+        config = self._make_config(extra_config={"backend": "mooncake", "use_layerwise": True})
+        scheduler = KVPoolScheduler(config, use_layerwise=True)
+        scheduler.kv_cache_group_ids = [0, 2]
+        scheduler.grouped_block_size = [16, 8, 8]
+        scheduler.hash_block_size = 8
+        scheduler.use_hybrid = True
+        scheduler.store_scheduler.batch_is_exist.side_effect = [
+            [1, 1],
+            [1, 1, 1, 0],
+        ]
+        request = MagicMock(
+            request_id="r1",
+            prompt_token_ids=list(range(32)),
+            num_tokens=32,
+            num_computed_tokens=0,
+            block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+        )
+
+        need, _ = scheduler.get_num_new_matched_tokens(request, 0)
+
+        # Group 2 only pooled 24 of the 32 tokens, so the overall hit is 24.
+        self.assertEqual(need, 24)
+        tracker = RequestTracker(
+            req_id="r1",
+            token_len=32,
+            allocated_block_ids_by_group=[[0, 1], [0, 1, 2, 3]],
+            num_saved_tokens=0,
+            num_prompt_tokens=32,
+            block_sizes=[16, 8, 8],
+        )
+        meta = scheduler._build_req_meta(
+            tracker,
+            request.block_hashes,
+            scheduler.load_specs["r1"],
+            request.prompt_token_ids,
+            None,
+        )
+
+        self.assertIsNotNone(meta)
+        self.assertIsNotNone(meta.load_spec)
+        self.assertEqual(meta.load_spec.kvpool_hits_per_group, {0: 32, 2: 24})
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_running_chunk_reloads_prefix_with_layer_reuse(self, mock_client_cls):

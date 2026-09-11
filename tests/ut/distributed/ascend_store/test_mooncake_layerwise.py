@@ -19,7 +19,7 @@ import os
 import threading
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -164,6 +164,51 @@ class TestMooncakeLayerSaveSession(unittest.TestCase):
         store.batch_commit.assert_called_once_with(["key"])
         self.assertEqual(tracker.prepare_load_entries("r1", []), [("key", 0)])
 
+    def test_single_group_revoked_key_is_not_rewritten_before_its_commit(self):
+        """Single-group behaviour kept while revoked keys became group-scoped."""
+        store = MagicMock()
+        store.batch_copy_put.side_effect = [[-1], [30]]
+        store.batch_commit.return_value = [0]
+        store.batch_revoke.return_value = [-1]
+        builder = LayerBatchBuilder(make_token_database(), page_size_bytes=60, num_layers=2)
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            sync_save_events=[MagicMock(), MagicMock()],
+            group_builders=[builder],
+        )
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[], is_last_chunk=True)
+        request.save_block_keys = ["key"]
+
+        for layer_id in range(2):
+            task = LayerTransferTask(
+                layer_id=layer_id,
+                layer_idx_in_group=layer_id,
+                block_ranges=[LayerBlockRange(request, 0, 1)],
+                shared_block_data=builder.build_shared(
+                    LayerTransferTask(
+                        layer_id=layer_id,
+                        block_ranges=[LayerBlockRange(request, 0, 1)],
+                        use_key_major_ranges=True,
+                    )
+                ),
+                use_key_major_ranges=True,
+            )
+            thread.add_stored_request("r1")
+            thread.request_queue.put([task])
+            thread._handle_request([task])
+
+        self.assertEqual(store.batch_copy_put.call_count, 1)
+        store.batch_commit.assert_not_called()
+
 
 class _FakeRangeBuilder:
     def __init__(self, group_id: int, num_layers: int):
@@ -253,6 +298,95 @@ class TestMooncakeRangeMultiGroupCommit(unittest.TestCase):
         thread._handle_request(layer1_task)
         self.assertEqual(store.batch_commit.call_args_list[1], ((["key-g1"],),))
         self.assertTrue(thread.layer_save_finished_events[1].is_set())
+
+    def test_revoked_key_of_non_committing_group_survives_other_group_commit(self):
+        """A failed put in one group must not be released by another group's commit."""
+        store, thread = self._make_thread()
+        thread.num_kv_cache_groups = 2
+        thread.group_builders = [
+            _FakeRangeBuilder(0, num_layers=2),
+            _FakeRangeBuilder(1, num_layers=1),
+        ]
+        # Layer 0 writes both groups in one batch; group 0's key fails.
+        store.batch_copy_put.side_effect = [[-1, 10], [10]]
+        store.batch_revoke.return_value = [-1]
+
+        def layer_task(group_id: int, layer_idx_in_group: int, layer_id: int) -> LayerTransferTask:
+            return LayerTransferTask(
+                layer_id=layer_id,
+                block_ranges=[],
+                group_id=group_id,
+                layer_idx_in_group=layer_idx_in_group,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            )
+
+        thread.add_stored_request("r1")
+        thread.add_stored_request("r1")
+        layer0_tasks = [layer_task(0, 0, 0), layer_task(1, 0, 0)]
+        thread.request_queue.put(layer0_tasks)
+        thread._handle_request(layer0_tasks)
+
+        # Group 1 is a single-layer group and commits right away; group 0 still
+        # owns a revoked key and must stay blocked until its own final layer.
+        self.assertEqual(store.batch_commit.call_args_list, [call(["key-g1"])])
+
+        store.batch_copy_put.reset_mock()
+        thread.add_stored_request("r1")
+        thread.add_stored_request("r1")
+        layer1_tasks = [layer_task(0, 1, 1)]
+        thread.request_queue.put(layer1_tasks)
+        thread._handle_request(layer1_tasks)
+
+        store.batch_copy_put.assert_not_called()
+        self.assertEqual(store.batch_commit.call_count, 1)
+
+    def test_multi_group_save_backend_calls_match_with_diag_enabled(self):
+        """Layer diagnostics must not change the transfer the backend observes."""
+
+        def run_layer(diag_enabled: bool):
+            store = MagicMock()
+            store.batch_copy_put.return_value = [10, 10]
+            store.batch_commit.return_value = [0]
+            thread = KVCacheStoreLayerSendingThread(
+                m_store=store,
+                token_database=make_token_database(),
+                block_size=16,
+                tp_rank=0,
+                tp_size=1,
+                dcp_size=1,
+                page_size_bytes=60,
+                ready_event=threading.Event(),
+                num_layers=2,
+                layer_save_finished_events=[threading.Event(), threading.Event()],
+                sync_save_events=[MagicMock(), MagicMock()],
+                group_builders=[
+                    _FakeRangeBuilder(0, num_layers=1),
+                    _FakeRangeBuilder(1, num_layers=2),
+                ],
+                num_kv_cache_groups=2,
+            )
+            tasks = [
+                LayerTransferTask(
+                    layer_id=0,
+                    block_ranges=[],
+                    group_id=group_id,
+                    layer_idx_in_group=0,
+                    shared_block_data=MagicMock(),
+                    use_key_major_ranges=True,
+                )
+                for group_id in (0, 1)
+            ]
+            thread.request_queue.put(tasks)
+            with patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer._layer_diag_enabled",
+                return_value=diag_enabled,
+            ):
+                thread._handle_request(tasks)
+            return store.mock_calls
+
+        self.assertTrue(run_layer(diag_enabled=False))
+        self.assertEqual(run_layer(diag_enabled=False), run_layer(diag_enabled=True))
 
 
 class TestMooncakeRangeMultiGroupBatchedTransfer(unittest.TestCase):
@@ -759,7 +893,7 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
                 kvpool_cached_tokens=8,
                 can_load=True,
                 kvpool_store_skip_tokens=8,
-                kvpool_hits_per_group=[8, 24],
+                kvpool_hits_per_group={0: 8, 1: 24},
             ),
         )
 
@@ -770,6 +904,78 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         # 1..3 (the min-over-groups mask only guarded 8 tokens).
         self.assertEqual(request.save_block_keys_by_group[0], ["model@0@6833@0"])
         self.assertEqual(request.save_block_keys_by_group[1], ["model@1@6833@0"])
+
+    def test_put_session_diag_reports_skipped_pooled_prefix(self):
+        worker = self._make_worker()
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            save_start_token=0,
+            save_end_token=32,
+            block_ids=[1, 2],
+            block_hashes=[b"h0", b"h1"],
+            can_save=True,
+            load_spec=LoadSpec(
+                0,
+                32,
+                can_load=True,
+                kvpool_store_skip_tokens=32,
+                kvpool_hits_per_group={0: 32},
+            ),
+        )
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker._layer_diag_enabled",
+                return_value=True,
+            ),
+            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker._emit_layer_diag") as emit,
+        ):
+            worker._prepare_mooncake_put_session(request)
+
+        payloads = [call_item.args[0] for call_item in emit.call_args_list]
+        put = [payload for payload in payloads if payload.get("event") == "put_session"]
+        self.assertEqual(len(put), 1)
+        # The whole chunk was already pooled: no put session must be opened, and
+        # the diagnostic has to say so instead of silently emitting nothing.
+        self.assertEqual(put[0]["keys_total"], 0)
+        self.assertTrue(put[0]["skipped_pooled_prefix"])
+        self.assertTrue(put[0]["has_load_spec"])
+        self.assertEqual(put[0]["pool_hit_tokens"], 32)
+        self.assertEqual(put[0]["save_start_token"], 0)
+        self.assertEqual(put[0]["save_end_token"], 32)
+        worker.m_store.batch_put_start.assert_not_called()
+
+    def test_put_session_diag_flags_running_chunk_without_load_spec(self):
+        worker = self._make_worker()
+        worker.m_store.batch_put_start.return_value = [0]
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            save_start_token=16,
+            save_end_token=32,
+            block_ids=[1, 2],
+            block_hashes=[b"h0", b"h1"],
+            can_save=True,
+        )
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker._layer_diag_enabled",
+                return_value=True,
+            ),
+            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker._emit_layer_diag") as emit,
+        ):
+            worker._prepare_mooncake_put_session(request)
+
+        put = [
+            call_item.args[0] for call_item in emit.call_args_list if call_item.args[0].get("event") == "put_session"
+        ]
+        self.assertEqual(len(put), 1)
+        # Chunks that continue an already running request carry no LoadSpec, so
+        # they legitimately report no pooled-prefix hit.
+        self.assertFalse(put[0]["has_load_spec"])
+        self.assertFalse(put[0]["skipped_pooled_prefix"])
+        self.assertEqual(put[0]["pool_hit_tokens"], 0)
+        self.assertEqual(put[0]["save_start_token"], 16)
 
     def test_put_exists_filter_drops_already_pooled_keys(self):
         worker = self._make_worker()
