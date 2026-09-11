@@ -1284,6 +1284,8 @@ class LayerTransferTask:
     # KVPP shards layers across ranks, so layer_idx_in_group addresses the
     # entries this rank registered instead of the rank-global layer id.
     layer_idx_is_local: bool = False
+    # Group-local completion differs from the physical model layer boundary.
+    final_group_layer: bool = False
 
 
 @dataclass
