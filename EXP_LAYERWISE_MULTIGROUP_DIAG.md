@@ -118,10 +118,19 @@ Python 组装耗时；`copy_ms`/`batch_ms` = 实际 `batch_copy_get` 耗时；`s
 - 验收（修正后）：各组命中不齐时 `[min, 本组自身命中)` 段不再 put；master
   `object_already_exists` 只统计“本请求写入区间内的重复”；不以“chunk1 already_existing → 0”为准。
 
-## 跨组 revoke 清理（2026-09-11 修复）
+## 每 step 一次提交（与 MemCache 对齐）
 
-多组 save 过去在“本层有**任一**组 commit”时清空共享的 `_revoked_put_keys`。当一层里出现
-`commit_groups=[1,0,1]` 这类不均齐提交流水（`exp_logs/new_log1.md` 实测存在）时，某一组因
-`batch_copy_put` 失败被 revoke 的 key 会被兄弟组的 commit 提前解除标记，存在提交“只写了部分层”
-对象的静默数据损坏风险。现在 revoked key 按 group 记录（`_revoked_put_key_groups`），
-**只有拥有它的组 commit 时才释放**；单组路径行为不变。
+早期实现是“每个组在自己最后一层 commit”，一步之内会发出和组数一样多的控制调用
+（DSV4 为 6 次），而 TE 是单线程的，这些调用会插在逐层拷贝之间，把下一层的搬运往后推。
+现在改为 MemCache `batch_write_finish` 的语义：
+
+- save 线程把本 step 所有成功写过的 key 累积到 `_pending_commit_keys`；
+- 末层 `save_kv_layer` 在排入最后一层的 save 任务之后，入队一个 `_LayerCommitTask`；
+- 线程处理该任务时用**一次** `batch_put_session_end` 提交全部 key（按
+  `layerwise_max_transfer_blocks` 切批），再 `commit_put_keys` + `_remove_started_keys`；
+- 被 revoke 的 key（`batch_copy_put` 失败）不进 `_pending_commit_keys`，也不会出现在这次提交里；
+  提交完成后统一清空 revoke 标记，进入下一个 step。
+
+可见性因此变为“某 step 的所有组、所有层在 step 末一起可见”，与 MemCache 一致；代价是某个组
+在自己末层之后、step 结束之前不可见（可接受：同 step 内没有别的请求会依赖它）。
+单组路径同样走这次 step 提交。

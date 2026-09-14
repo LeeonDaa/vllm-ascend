@@ -19,7 +19,7 @@ import os
 import threading
 import types
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -28,6 +28,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreLayerRecvingThread,
     KVTransferThread,
     LayerBatchBuilder,
+    _LayerCommitTask,
     _LayerEndSessionTask,
     _build_range_debug_payload,
     _layer_diag_enabled,
@@ -115,7 +116,14 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
 
 
 class TestMooncakeLayerSaveSession(unittest.TestCase):
-    def test_final_layer_commits_after_all_ranges(self):
+    @staticmethod
+    def _flush_step(thread) -> None:
+        """Run the step-end commit the way ``save_kv_layer`` queues it."""
+        task = _LayerCommitTask(thread.final_layer_id)
+        thread.request_queue.put(task)
+        thread._handle_request(task)
+
+    def test_step_flush_commits_after_all_ranges(self):
         store = MagicMock()
         # Range APIs may return the positive number of bytes moved on success.
         store.batch_copy_put.return_value = [30]
@@ -160,6 +168,11 @@ class TestMooncakeLayerSaveSession(unittest.TestCase):
             thread.add_stored_request("r1")
             thread.request_queue.put([task])
             thread._handle_request([task])
+
+        # No group commits on its own final layer: the whole step publishes once.
+        store.batch_commit.assert_not_called()
+
+        self._flush_step(thread)
 
         self.assertEqual(store.batch_copy_put.call_count, 2)
         store.batch_commit.assert_called_once_with(["key"])
@@ -210,6 +223,11 @@ class TestMooncakeLayerSaveSession(unittest.TestCase):
         self.assertEqual(store.batch_copy_put.call_count, 1)
         store.batch_commit.assert_not_called()
 
+        self._flush_step(thread)
+
+        # The revoked key never becomes visible, not even in the step commit.
+        store.batch_commit.assert_not_called()
+
 
 class _FakeRangeBuilder:
     def __init__(self, group_id: int, num_layers: int):
@@ -231,12 +249,13 @@ class _FakeRangeBuilder:
 
 
 class TestMooncakeRangeMultiGroupCommit(unittest.TestCase):
-    """Group sessions commit at each group's own final layer."""
+    """Every group of a step is published by one session-end call."""
 
     def _make_thread(self):
         store = MagicMock()
         store.batch_copy_put.return_value = [10]
-        store.batch_commit.return_value = [0]
+        # The step commit carries every written key at once.
+        store.batch_commit.side_effect = lambda keys: [0] * len(keys)
         thread = KVCacheStoreLayerSendingThread(
             m_store=store,
             token_database=make_token_database(),
@@ -256,7 +275,13 @@ class TestMooncakeRangeMultiGroupCommit(unittest.TestCase):
         )
         return store, thread
 
-    def test_short_group_commits_before_global_final_layer(self):
+    @staticmethod
+    def _flush_step(thread) -> None:
+        task = _LayerCommitTask(thread.final_layer_id)
+        thread.request_queue.put(task)
+        thread._handle_request(task)
+
+    def test_group_final_layer_does_not_commit_until_step_flush(self):
         store, thread = self._make_thread()
         layer0_tasks = [
             LayerTransferTask(
@@ -279,9 +304,9 @@ class TestMooncakeRangeMultiGroupCommit(unittest.TestCase):
         thread.request_queue.put(layer0_tasks)
         thread._handle_request(layer0_tasks)
 
-        # Group 0 has a single layer and is committed right away; group 1
-        # still has one more layer and must stay open.
-        store.batch_commit.assert_called_once_with(["key-g0"])
+        # Group 0 has a single layer but must stay invisible until the step
+        # commit publishes every group (MemCache batch_write_finish semantics).
+        store.batch_commit.assert_not_called()
 
         layer1_task = [
             LayerTransferTask(
@@ -297,11 +322,15 @@ class TestMooncakeRangeMultiGroupCommit(unittest.TestCase):
         thread.add_stored_request("r1")
         thread.request_queue.put(layer1_task)
         thread._handle_request(layer1_task)
-        self.assertEqual(store.batch_commit.call_args_list[1], ((["key-g1"],),))
+        store.batch_commit.assert_not_called()
+
+        self._flush_step(thread)
+
+        store.batch_commit.assert_called_once_with(["key-g0", "key-g1"])
         self.assertTrue(thread.layer_save_finished_events[1].is_set())
 
-    def test_revoked_key_of_non_committing_group_survives_other_group_commit(self):
-        """A failed put in one group must not be released by another group's commit."""
+    def test_step_flush_excludes_revoked_keys(self):
+        """A key whose range copy failed is never committed by the step flush."""
         store, thread = self._make_thread()
         thread.num_kv_cache_groups = 2
         thread.group_builders = [
@@ -328,10 +357,6 @@ class TestMooncakeRangeMultiGroupCommit(unittest.TestCase):
         thread.request_queue.put(layer0_tasks)
         thread._handle_request(layer0_tasks)
 
-        # Group 1 is a single-layer group and commits right away; group 0 still
-        # owns a revoked key and must stay blocked until its own final layer.
-        self.assertEqual(store.batch_commit.call_args_list, [call(["key-g1"])])
-
         store.batch_copy_put.reset_mock()
         thread.add_stored_request("r1")
         thread.add_stored_request("r1")
@@ -340,7 +365,57 @@ class TestMooncakeRangeMultiGroupCommit(unittest.TestCase):
         thread._handle_request(layer1_tasks)
 
         store.batch_copy_put.assert_not_called()
-        self.assertEqual(store.batch_commit.call_count, 1)
+        self._flush_step(thread)
+
+        store.batch_commit.assert_called_once_with(["key-g1"])
+
+    def test_commit_covers_all_written_keys_once(self):
+        store, thread = self._make_thread()
+        thread.num_kv_cache_groups = 2
+        store.batch_copy_put.side_effect = [[10, 10], [10]]
+        layer0_tasks = [
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=0,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+            LayerTransferTask(
+                layer_id=0,
+                block_ranges=[],
+                group_id=1,
+                layer_idx_in_group=0,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            ),
+        ]
+        layer1_tasks = [
+            LayerTransferTask(
+                layer_id=1,
+                block_ranges=[],
+                group_id=1,
+                layer_idx_in_group=1,
+                shared_block_data=MagicMock(),
+                use_key_major_ranges=True,
+            )
+        ]
+        for tasks in (layer0_tasks, layer1_tasks):
+            thread.add_stored_request("r1")
+            thread.request_queue.put(tasks)
+            thread._handle_request(tasks)
+
+        self._flush_step(thread)
+
+        # The same object key is written by several layers; the flush commits
+        # each object exactly once, across all groups.
+        store.batch_commit.assert_called_once_with(["key-g0", "key-g1"])
+
+    def test_step_flush_without_written_keys_skips_backend_call(self):
+        store, thread = self._make_thread()
+        self._flush_step(thread)
+        store.batch_commit.assert_not_called()
 
     def test_multi_group_save_backend_calls_match_with_diag_enabled(self):
         """Layer diagnostics must not change the transfer the backend observes."""
@@ -396,7 +471,7 @@ class TestMooncakeRangeMultiGroupBatchedTransfer(unittest.TestCase):
     def test_multi_group_save_batches_put_and_sync_per_layer(self):
         store = MagicMock()
         store.batch_copy_put.return_value = [10, 10]
-        store.batch_commit.return_value = [0]
+        store.batch_commit.side_effect = lambda keys: [0] * len(keys)
         thread = KVCacheStoreLayerSendingThread(
             m_store=store,
             token_database=make_token_database(),
@@ -436,10 +511,16 @@ class TestMooncakeRangeMultiGroupBatchedTransfer(unittest.TestCase):
         thread.request_queue.put(layer0_tasks)
         thread._handle_request(layer0_tasks)
         # One batched put covering both groups, one per-layer stream sync, then
-        # the short group commits immediately while the longer group stays open.
+        # the step commit publishes both groups together at the end of the step.
         self.assertEqual(store.batch_copy_put.call_count, 1)
         self.assertEqual(thread.sync_save_events[0].synchronize.call_count, 1)
-        store.batch_commit.assert_called_once_with(["key-g0"])
+        store.batch_commit.assert_not_called()
+
+        task = _LayerCommitTask(thread.final_layer_id)
+        thread.request_queue.put(task)
+        thread._handle_request(task)
+
+        store.batch_commit.assert_called_once_with(["key-g0", "key-g1"])
 
     def test_multi_group_load_batches_get_per_layer(self):
         store = MagicMock()
@@ -809,6 +890,19 @@ class TestMooncakePrefetchAnchoring(unittest.TestCase):
         # The window settles one below the target (same steady state the original
         # layer-0 burst produced), without the initial burst.
         self.assertEqual(lead, worker.num_prefetch_layers - 1)
+
+    def test_last_save_layer_queues_step_commit(self):
+        """The step commit is queued after the last layer's save tasks."""
+        worker = self._make_worker(num_layers=2)
+        worker.current_layer = 1
+        worker.sync_save_events = [MagicMock(), MagicMock()]
+        worker.layer_save_finished_events = [threading.Event(), threading.Event()]
+        worker.layer_save_tasks = [[], []]
+        worker.kv_send_thread = MagicMock()
+
+        KVPoolWorker.save_kv_layer(worker, MagicMock())
+
+        worker.kv_send_thread.add_commit_request.assert_called_once_with(1)
 
 
 class TestMooncakeWorkerSessionPreparation(unittest.TestCase):

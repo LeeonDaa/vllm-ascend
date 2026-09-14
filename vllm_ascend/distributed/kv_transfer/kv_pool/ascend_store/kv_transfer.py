@@ -135,6 +135,13 @@ class _LayerEndSessionTask:
     keys: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _LayerCommitTask:
+    """Publish every object written in this step with a single session-end call."""
+
+    layer_id: int
+
+
 class LayerBatchBuilder:
     def __init__(
         self,
@@ -1610,11 +1617,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self._put_started_keys_lock = put_started_keys_lock or threading.Lock()
         self._session_tracker = session_tracker
         self._active_put_keys: set[str] | None = None
-        # Keys whose put session was revoked, plus the KV cache group that owns
-        # them. A group's revoked keys are released only when that group commits,
-        # so a failing group can never be unblocked by a sibling group's commit.
+        # Keys whose put session was revoked during this step: kept out of later
+        # range writes and out of the step commit, then dropped when the step
+        # publishes (one commit per step, MemCache write_finish style).
         self._revoked_put_keys: set[str] = set()
-        self._revoked_put_key_groups: dict[str, int] = {}
+        self._pending_commit_keys: set[str] = set()
         self.num_kv_cache_groups = num_kv_cache_groups
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
         if group_builders is not None:
@@ -1645,6 +1652,10 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         if deduplicated_keys:
             self.request_queue.put(_LayerRevokeTask(deduplicated_keys))
 
+    def add_commit_request(self, layer_id: int) -> None:
+        """Queue the step-end commit after the layer's save tasks."""
+        self.request_queue.put(_LayerCommitTask(layer_id))
+
     def _remove_started_keys(self, keys: list[str]) -> None:
         with self._put_started_keys_lock:
             self._put_started_keys.difference_update(keys)
@@ -1664,33 +1675,14 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if self._session_tracker is not None:
                 self._session_tracker.revoke_put_keys(keys)
 
-    def _mark_revoked_put_keys(self, keys: list[str], group_id: int) -> None:
-        """Block revoked keys from further writes until their group commits."""
+    def _mark_revoked_put_keys(self, keys: list[str]) -> None:
+        """Block revoked keys from further writes until the step commit."""
         for key in keys:
             self._revoked_put_keys.add(key)
-            self._revoked_put_key_groups[key] = group_id
-
-    def _release_revoked_put_keys(self, group_id: int) -> None:
-        """Release the revoked keys owned by one group after that group committed."""
-        owned = [key for key, owner in self._revoked_put_key_groups.items() if owner == group_id]
-        for key in owned:
-            self._revoked_put_keys.discard(key)
-            del self._revoked_put_key_groups[key]
-
-    def _range_key_group_id(self, key: str) -> int:
-        """Recover the owning group of a range key for keys revoked outside a task."""
-        if self.num_kv_cache_groups <= 1:
-            return 0
-        parts = key.split("@")
-        if len(parts) >= 2 and parts[1].isdigit():
-            return int(parts[1])
-        return 0
 
     def _handle_range_request(
         self,
         req_meta: LayerRangeReqMeta,
-        commit_group: bool = False,
-        group_id: int = 0,
     ) -> None:
         layer_id = req_meta.layer_id
         active_indices = [index for index, key in enumerate(req_meta.keys) if key not in self._revoked_put_keys]
@@ -1720,17 +1712,22 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:
                 self._revoke_range_keys(failed_keys)
-                self._mark_revoked_put_keys(failed_keys, group_id)
+                self._mark_revoked_put_keys(failed_keys)
+            self._pending_commit_keys.update(
+                key for key, result in zip(active_keys, results, strict=True) if result >= 0
+            )
 
-        if not commit_group:
-            return
-        self._commit_range_meta(req_meta)
-        self._release_revoked_put_keys(group_id)
+    def _flush_commit_keys(self, layer_id: int) -> None:
+        """Publish every object written in this step with one session-end call.
 
-    def _commit_range_meta(self, req_meta: LayerRangeReqMeta) -> None:
-        """Commit one group's range-session object once its final layer is written."""
-        layer_id = req_meta.layer_id
-        active_keys = [key for key in req_meta.keys if key not in self._revoked_put_keys]
+        Mirrors MemCache's ``batch_write_finish``: instead of one commit per KV
+        cache group at that group's own final layer, the whole step commits once,
+        so the single-threaded transfer engine sees one control call instead of
+        one per group.
+        """
+        # Sorted for reproducible logs/tests; the backend does not care about order.
+        active_keys = sorted(key for key in self._pending_commit_keys if key not in self._revoked_put_keys)
+        self._pending_commit_keys.clear()
         if active_keys:
             try:
                 commit_results = require_aligned_batch_results(
@@ -1747,6 +1744,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if self._session_tracker is not None:
                 self._session_tracker.commit_put_keys(committed_keys)
             self._remove_started_keys(active_keys)
+        # Every group of this step is finished; drop the revoked markers.
+        self._revoked_put_keys.clear()
 
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
         layer_id = transfer_tasks[0].layer_id if transfer_tasks else 0
@@ -1770,12 +1769,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 req_meta = builder.build_addrs(shared, task.layer_idx_in_group)
                 if not isinstance(req_meta, LayerRangeReqMeta):
                     raise TypeError(f"Expected Mooncake range metadata, got {type(req_meta).__name__}")
-                # Commit a group's range session as soon as its own final
-                # physical layer was written. In multi-group (hybrid) models
-                # this can happen earlier than the global final layer (e.g.
-                # when a trailing MTP layer is covered by another group).
-                commit_group = task.layer_idx_in_group == builder.num_layers - 1
-                self._handle_range_request(req_meta, commit_group=commit_group, group_id=task.group_id)
+                self._handle_range_request(req_meta)
                 processed_meta.append(req_meta)
                 for req_id in req_meta.req_ids:
                     self.dec_stored_request(req_id)
@@ -1790,7 +1784,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             )
             self._revoke_range_keys(keys_to_revoke)
             for key in keys_to_revoke:
-                self._mark_revoked_put_keys([key], self._range_key_group_id(key))
+                self._mark_revoked_put_keys([key])
             raise
         finally:
             if not self.layer_save_finished_events[layer_id].is_set():
@@ -1847,7 +1841,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             return
 
         active_keys: list[str] = []
-        active_key_groups: list[int] = []
         all_buffers: list[list[int]] = []
         all_sizes: list[list[int]] = []
         all_offsets: list[list[int]] = []
@@ -1856,7 +1849,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 if key in self._revoked_put_keys:
                     continue
                 active_keys.append(key)
-                active_key_groups.append(group_id)
                 all_buffers.append(req_meta.all_buffers[index])
                 all_sizes.append(req_meta.all_sizes[index])
                 all_offsets.append(req_meta.all_offsets[index])
@@ -1907,15 +1899,13 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 )
                 save_batch_ms.append(round((time.perf_counter() - batch_start) * 1000, 3))
             _emit_range_debug_event("save", layer_id, all_sizes, all_offsets, results)
-            failed = [
-                (key, owner)
-                for key, owner, result in zip(active_keys, active_key_groups, results, strict=True)
-                if result < 0
-            ]
-            if failed:
-                self._revoke_range_keys([key for key, _owner in failed])
-                for key, owner in failed:
-                    self._mark_revoked_put_keys([key], owner)
+            failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
+            if failed_keys:
+                self._revoke_range_keys(failed_keys)
+                self._mark_revoked_put_keys(failed_keys)
+            self._pending_commit_keys.update(
+                key for key, result in zip(active_keys, results, strict=True) if result >= 0
+            )
 
         if _layer_diag_enabled():
             _emit_layer_diag(
@@ -1928,12 +1918,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     "batch_ms": save_batch_ms,
                 }
             )
-        for req_meta, commit_group, group_id in metas:
-            if commit_group:
-                self._commit_range_meta(req_meta)
-                # Only this group's revoked keys are released; a sibling group
-                # that committed in the same layer must not unblock them.
-                self._release_revoked_put_keys(group_id)
+        for req_meta, *_rest in metas:
             processed_meta.append(req_meta)
             for req_id in req_meta.req_ids:
                 self.dec_stored_request(req_id)
@@ -1941,6 +1926,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
     def _handle_request(  # type: ignore[override]
         self, request: list[LayerTransferTask] | _LayerRevokeTask
     ):
+        if isinstance(request, _LayerCommitTask):
+            try:
+                self._flush_commit_keys(request.layer_id)
+            finally:
+                self.request_queue.task_done()
+            return
         if isinstance(request, _LayerRevokeTask):
             try:
                 self._revoke_range_keys(list(request.keys))

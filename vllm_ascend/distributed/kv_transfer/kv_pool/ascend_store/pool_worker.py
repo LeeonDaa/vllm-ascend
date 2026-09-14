@@ -2372,6 +2372,10 @@ class KVPoolWorker:
         else:
             self.layer_save_finished_events[self.current_layer].set()
         if self.current_layer == self.num_layers - 1:
+            # Publish the whole step (all groups, all layers) with one call, the
+            # way MemCache's batch_write_finish does; queued after the last
+            # layer's save tasks so every range copy lands first.
+            send_thread.add_commit_request(self.num_layers - 1)
             while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10):
                 send_thread.raise_if_failed()
                 logger.info("Layerwise %d save not done, keep waiting", self.current_layer)
