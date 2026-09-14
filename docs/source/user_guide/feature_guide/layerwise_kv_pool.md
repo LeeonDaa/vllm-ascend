@@ -96,11 +96,12 @@ For Mooncake, configure `MOONCAKE_CONFIG_PATH` as usual and select the backend:
 
 Mooncake stores one object for each `(model, block hash, saving TP/head rank)`.
 Every object's byte layout is the concatenation of all local KV layers. A put
-session is opened before the forward pass, each layer writes only its byte
-range, and every object written in a step is committed together **once per
-step** (the MemCache `batch_write_finish` equivalent), after the final layer's
-ranges land. Loads use a get session over the same object and read one layer
-range at a time.
+session is opened for all KV cache groups of a step with a single
+`batch_put_session_start`, each layer writes only its byte range, and every
+object written in that step is committed together **once per step** (the
+MemCache `batch_write_finish` equivalent), after the final layer's ranges land.
+Loads open one get session for the step and close it once; each layer reads its
+own byte range from the same object.
 
 ### Key Parameters
 

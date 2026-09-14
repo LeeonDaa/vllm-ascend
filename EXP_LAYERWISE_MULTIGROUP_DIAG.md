@@ -122,14 +122,20 @@ Python 组装耗时；`copy_ms`/`batch_ms` = 实际 `batch_copy_get` 耗时；`s
 
 早期实现是“每个组在自己最后一层 commit”，一步之内会发出和组数一样多的控制调用
 （DSV4 为 6 次），而 TE 是单线程的，这些调用会插在逐层拷贝之间，把下一层的搬运往后推。
-现在改为 MemCache `batch_write_finish` 的语义：
+现在改为 MemCache `batch_write_finish` 的语义，**put / get 两侧的控制调用同样收敛成每 step 一次**：
 
-- save 线程把本 step 所有成功写过的 key 累积到 `_pending_commit_keys`；
-- 末层 `save_kv_layer` 在排入最后一层的 save 任务之后，入队一个 `_LayerCommitTask`；
-- 线程处理该任务时用**一次** `batch_put_session_end` 提交全部 key（按
-  `layerwise_max_transfer_blocks` 切批），再 `commit_put_keys` + `_remove_started_keys`；
+| 方向 | 控制调用 | 每 step 次数 | 说明 |
+| :-- | :-- | :-- | :-- |
+| put | `batch_put_session_start` | 1（原 6） | `_prepare_mooncake_put_session` 只收集候选 key（含各组对象 size），`_start_mooncake_put_session` 统一发一次 |
+| put | `batch_put_session_end`（commit） | 1（原 6） | save 线程累积 `_pending_commit_keys`，末层入队 `_LayerCommitTask` 后一次提交 |
+| get | `batch_get_session_start` | 1 | 本 step 所有请求/组的 key 合成一次调用 |
+| get | `batch_get_session_end` | 1 | 末层把 key 交给 recv 线程，由传输线程一次关闭 |
+
 - 被 revoke 的 key（`batch_copy_put` 失败）不进 `_pending_commit_keys`，也不会出现在这次提交里；
   提交完成后统一清空 revoke 标记，进入下一个 step。
+- `put_session` 事件的 `put_start_ms` 现在恒为 0（该 step 只有一次共享调用），真实耗时在新的
+  `{"event":"put_start","keys_total":N,"newly_started":M,"batches":B,"ms":X}` 事件里；把各行相加
+  不会再重复计数。
 
 可见性因此变为“某 step 的所有组、所有层在 step 末一起可见”，与 MemCache 一致；代价是某个组
 在自己末层之后、step 结束之前不可见（可接受：同 step 内没有别的请求会依赖它）。

@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -105,6 +106,30 @@ LAYERWISE_READ_LEASE_TTL_MS = 5 * 60 * 1000
 MEMCACHE_UNMATCHED_STATE = -3101
 PARTIAL_LEASE_RETRY_COUNT = 10
 PARTIAL_LEASE_RETRY_INTERVAL_S = 0.001
+
+
+@dataclass
+class _PendingPutStart:
+    """One KV cache group's put-session candidates of a step.
+
+    ``_prepare_mooncake_put_session`` only collects these; the single
+    ``batch_put_start`` call of the step is issued by
+    ``_start_mooncake_put_session`` once every group and request is collected.
+    """
+
+    request: ReqMeta
+    group_id: int
+    group_keys: list[str | None]
+    key_slots: list[tuple[str, int | None, int]]
+    new_keys: list[str]
+    previously_started: set[str]
+    num_groups: int
+    start_block: int
+    end_block: int
+    store_skip_tokens: int
+    pool_hit_tokens: int
+    has_load_spec: bool
+    keys_total: int
 
 
 class KVPoolWorker:
@@ -402,6 +427,7 @@ class KVPoolWorker:
         self._allocated_gvas: dict[str, int] = {}
         self._put_started_keys: set[str] = set()
         self._put_started_keys_lock = threading.Lock()
+        self._pending_put_starts: list[_PendingPutStart] = []
         self._load_session_lock = threading.Lock()
         self._layer_load_aborted = threading.Event()
         self._mooncake_session_tracker = MooncakeSessionTracker()
@@ -1647,14 +1673,17 @@ class KVPoolWorker:
         batch_size = self.layerwise_max_transfer_blocks if self.layerwise_max_transfer_blocks > 0 else max(1, len(keys))
         return [keys[start : start + batch_size] for start in range(0, len(keys), batch_size)]
 
-    def _start_mooncake_put_keys(self, keys: list[str], object_size: int) -> list[int]:
+    def _start_mooncake_put_keys(self, keys: list[str], object_sizes: list[int]) -> list[int]:
         results: list[int] = []
-        for key_batch in self._mooncake_key_batches(keys):
+        batch_size = self.layerwise_max_transfer_blocks if self.layerwise_max_transfer_blocks > 0 else max(1, len(keys))
+        for start in range(0, len(keys), batch_size):
+            key_batch = keys[start : start + batch_size]
+            size_batch = object_sizes[start : start + batch_size]
             results.extend(
                 require_aligned_batch_results(
                     "batch_put_start",
                     key_batch,
-                    self.m_store.batch_put_start(key_batch, [object_size] * len(key_batch)),
+                    self.m_store.batch_put_start(key_batch, size_batch),
                 )
             )
         return results
@@ -1878,61 +1907,25 @@ class KVPoolWorker:
                 except Exception as exc:  # pragma: no cover - backend specific
                     logger.warning("Layerwise put exists-filter failed error=%s", exc)
 
-            started = set(previously_started)
-            put_start_ms = 0.0
-            newly_started_count = 0
-            already_existing_count = 0
-            if new_keys:
-                try:
-                    put_start_ts = time.perf_counter()
-                    results = self._start_mooncake_put_keys(
-                        new_keys,
-                        self._mooncake_object_size_bytes(group_id),
-                    )
-                    put_start_ms = round((time.perf_counter() - put_start_ts) * 1000, 3)
-                except Exception as exc:
-                    logger.error("Mooncake batch_put_start failed keys=%s error=%s", new_keys, exc)
-                    with self._put_started_keys_lock:
-                        self._put_started_keys.update(new_keys)
-                    self._queue_layerwise_revoke_keys(new_keys)
-                else:
-                    newly_started = {key for key, result in zip(new_keys, results, strict=True) if result == 0}
-                    newly_started_count = len(newly_started)
-                    already_existing_count = len(new_keys) - newly_started_count
-                    with self._put_started_keys_lock:
-                        self._put_started_keys.update(newly_started)
-                    started.update(newly_started)
-
-            self._emit_put_session_diag(
-                request=request,
-                group_id=group_id,
-                start_block=start_block,
-                end_block=end_block,
-                store_skip_tokens=store_skip_tokens,
-                pool_hit_tokens=pool_hit_tokens,
-                has_load_spec=has_load_spec,
-                keys_total=len(requested_keys),
-                new_keys_count=len(new_keys),
-                newly_started_count=newly_started_count,
-                already_existing_count=already_existing_count,
-                put_start_ms=put_start_ms,
-            )
-
-            for key, slot, _ in key_slots:
-                if key in started:
-                    if slot is None:
-                        request.save_last_block_key_by_group[group_id] = key
-                elif slot is None:
-                    request.save_last_block_key_by_group[group_id] = None
-                else:
-                    group_keys[slot] = None
-            self._mooncake_session_tracker.register_put_keys(
-                request.req_id,
-                (
-                    (key, self._encode_mooncake_block_index(group_id, block_index))
-                    for key, _, block_index in key_slots
-                    if key in started
-                ),
+            # Session start is issued once per step (see
+            # ``_start_mooncake_put_session``), so only collect the candidates
+            # here together with everything needed to finish the bookkeeping.
+            self._pending_put_starts.append(
+                _PendingPutStart(
+                    request=request,
+                    group_id=group_id,
+                    group_keys=group_keys,
+                    key_slots=key_slots,
+                    new_keys=new_keys,
+                    previously_started=previously_started,
+                    num_groups=num_groups,
+                    start_block=start_block,
+                    end_block=end_block,
+                    store_skip_tokens=store_skip_tokens,
+                    pool_hit_tokens=pool_hit_tokens,
+                    has_load_spec=has_load_spec,
+                    keys_total=len(requested_keys),
+                )
             )
 
         # Single-group compatibility aliases used by the legacy code paths and
@@ -1941,6 +1934,95 @@ class KVPoolWorker:
             request.save_block_keys = request.save_block_keys_by_group[0]
             request.save_last_block_key = request.save_last_block_key_by_group[0]
             request.save_key_block_offset = request.save_key_block_offset_by_group[0]
+
+    def _start_mooncake_put_session(self) -> None:
+        """Open every group's put session of this step with one backend call.
+
+        Mirrors the step commit (``batch_put_session_end``): the single-threaded
+        transfer engine sees one ``batch_put_start`` per step instead of one per
+        KV cache group.
+        """
+        pending = self._pending_put_starts
+        self._pending_put_starts = []
+        if not pending:
+            return
+        object_sizes: dict[str, int] = {}
+        for record in pending:
+            size = self._mooncake_object_size_bytes(record.group_id)
+            for key in record.new_keys:
+                object_sizes.setdefault(key, size)
+        keys = list(object_sizes)
+        started_keys: set[str] = set()
+        put_start_ms = 0.0
+        if keys:
+            try:
+                put_start_ts = time.perf_counter()
+                results = self._start_mooncake_put_keys(keys, list(object_sizes.values()))
+                put_start_ms = round((time.perf_counter() - put_start_ts) * 1000, 3)
+            except Exception as exc:
+                logger.error("Mooncake batch_put_start failed keys=%s error=%s", keys, exc)
+                with self._put_started_keys_lock:
+                    self._put_started_keys.update(keys)
+                self._queue_layerwise_revoke_keys(keys)
+            else:
+                started_keys = {key for key, result in zip(keys, results, strict=True) if result == 0}
+                with self._put_started_keys_lock:
+                    self._put_started_keys.update(started_keys)
+        for record in pending:
+            self._apply_put_start(record, set(record.new_keys) & started_keys, put_start_ms)
+        if _layer_diag_enabled() and keys:
+            _emit_layer_diag(
+                {
+                    "event": "put_start",
+                    "req_ids": list(dict.fromkeys(record.request.req_id for record in pending)),
+                    "keys_total": len(keys),
+                    "newly_started": len(started_keys),
+                    "already_existing": len(keys) - len(started_keys),
+                    "batches": len(self._mooncake_key_batches(keys)),
+                    "ms": put_start_ms,
+                }
+            )
+
+    def _apply_put_start(self, record: _PendingPutStart, newly_started: set[str], put_start_ms: float) -> None:
+        """Finish one group's put-session bookkeeping after the step call."""
+        request = record.request
+        started = set(record.previously_started) | newly_started
+        for key, slot, _ in record.key_slots:
+            if key in started:
+                if slot is None:
+                    request.save_last_block_key_by_group[record.group_id] = key
+            elif slot is None:
+                request.save_last_block_key_by_group[record.group_id] = None
+            else:
+                record.group_keys[slot] = None
+        self._mooncake_session_tracker.register_put_keys(
+            request.req_id,
+            (
+                (key, self._encode_mooncake_block_index(record.group_id, block_index))
+                for key, _, block_index in record.key_slots
+                if key in started
+            ),
+        )
+        if record.num_groups == 1:
+            request.save_block_keys = request.save_block_keys_by_group[0]
+            request.save_last_block_key = request.save_last_block_key_by_group[0]
+            request.save_key_block_offset = request.save_key_block_offset_by_group[0]
+        self._emit_put_session_diag(
+            request=request,
+            group_id=record.group_id,
+            start_block=record.start_block,
+            end_block=record.end_block,
+            store_skip_tokens=record.store_skip_tokens,
+            pool_hit_tokens=record.pool_hit_tokens,
+            has_load_spec=record.has_load_spec,
+            keys_total=record.keys_total,
+            new_keys_count=len(record.new_keys),
+            newly_started_count=len(newly_started),
+            already_existing_count=len(record.new_keys) - len(newly_started),
+            # The step's single put-start call is reported by the put_start diag
+            # event; a per-group duration here would be counted several times.
+            put_start_ms=0.0,
+        )
 
     def _request_group_block_ids(self, request: ReqMeta, group_id: int) -> list[int]:
         if request.block_ids_by_group_np is not None and group_id < len(request.block_ids_by_group_np):
@@ -2171,6 +2253,7 @@ class KVPoolWorker:
         self._open_mooncake_get_sessions(get_key_slots)
         for request in requests:
             self._prepare_mooncake_put_session(request)
+        self._start_mooncake_put_session()
 
     def _build_shared_save_data(self) -> None:
         """Build shared block data once and attach to all layer save tasks.
