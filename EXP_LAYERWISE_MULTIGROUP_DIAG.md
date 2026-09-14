@@ -42,8 +42,8 @@ export GLOG_v=2
   "slices_per_row":[4,1,2],"fragments":4352,"batches":1,"stagger_ms":0.01,"prep_ms":0.3,"req_ids":[...]}
 (Worker_TPx_EPx ...) INFO ... [KVPOOL_LAYER_DIAG] {"event":"load_copy","layer_id":2,"copy_ms":19.7,
   "batch_ms":[19.7]}                     # 逐批 batch_copy_get 耗时（每层 1 批时=该层拷贝耗时）
-(Worker_TPx_EPx ...) INFO ... [KVPOOL_LAYER_DIAG] {"event":"timing","layer_id":2,"gated":true,
-  "waited_for_save":null,"submit_to_issue_ms":X,"issue_to_done_ms":Y}
+(Worker_TPx_EPx ...) INFO ... [KVPOOL_LAYER_DIAG] {"event":"timing","layer_id":2,"gated":false,
+  "waited_for_save":null,"submit_ts":T0,"issue_ts":T1,"done_ts":T2,"submit_to_issue_ms":X,"issue_to_done_ms":Y}
 (Worker_TPx_EPx ...) INFO ... [KVPOOL_LAYER_DIAG] {"event":"save_detail","layer_id":2,"keys_total":K,
   "sync_ms":S,"put_ms":P,"batch_ms":[...]}   # 保存侧：等计算事件 + batch_copy_put 耗时
 ```
@@ -66,7 +66,14 @@ Python 组装耗时；`copy_ms`/`batch_ms` = 实际 `batch_copy_get` 耗时；`s
 判读：
 - `HixlBatchGet ≈ fragments`（每 fragment 一次 HIXL get）；`hixlOpBatchRead` = 不同远端 transport 数（CPU 下发）。
 - 两族层（属 `{0,2,4}` vs `{1,3,5}`）的 `keys_total/fragments` 差异 → 解释 11/32 交叉。
-- `submit_to_issue_ms` 大且落在 `dsa_forward` 中后段 → 锚点太晚；对比 `layerwise_anchor=immediate`。
+- `submit_to_issue_ms` 大且落在 `dsa_forward` 中后段 → 锚点太晚；Mooncake 现在默认
+  `layerwise_anchor=immediate`（提交即放行，最大化与上一层计算的重叠），可显式设回 `attention` 做 A/B。
+- **重叠度算法**：`submit_ts` = 第 i 层入口提交 i+1 预取的时刻，`issue_ts` = 传输线程真正开始搬的时刻，
+  `done_ts` = 该层拷贝结束时刻。相邻两层 `submit_ts` 之差即该层可用计算窗口；把
+  `issue_ts - submit_ts`（等待）与 `done_ts - issue_ts`（本体）叠加到该窗口上，即可算出
+  "被隐藏/暴露"的比例——`issue_ts` 越接近上一个 `submit_ts`，说明传输等待越小。
+- 读会话的关闭（`batch_get_end`）已从计算线程挪到传输线程，因此 `timing` 的等待里不应再出现
+  计算线程发起的后端调用；若 `submit_to_issue_ms` 仍大，先看锁等待与 `_load_session_lock`。
 
 ## A/B 记录模板
 

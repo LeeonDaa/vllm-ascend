@@ -107,9 +107,9 @@ get session over the same object and read one layer range at a time.
 | `use_layerwise` | `false` | Enable layer-by-layer KV save/load. Supported with `backend: "memcache"` or `"mooncake"`. |
 | `backend` | `"mooncake"` | Storage backend. |
 | `mooncake_rpc_port` | `"0"` | RPC port for the scheduler↔worker lookup service. Use `"0"` to auto-assign, or a unique port per instance. |
-| `layerwise_prefetch_layers` | `1` | Positive number of layers to prefetch ahead of the compute frontier. Higher values improve overlap at the cost of memory. |
+| `layerwise_prefetch_layers` | `1` (`2` for Mooncake) | Positive number of layers to prefetch ahead of the compute frontier. Higher values improve overlap at the cost of memory. Mooncake defaults to `2` so one layer of transfer lead stays in flight while the previous layer computes. |
 | `layerwise_prefetch_ramp` | `2` | Maximum number of prefetch loads released per layer advance (integer `>= 2`). Prevents the first layers from bursting every prefetch at once. Mooncake multi-group only. |
-| `layerwise_anchor` | `"attention"` | When a prefetched layer load is released: `"attention"` waits for the attention compute boundary of the previous layer, `"immediate"` releases it as soon as the task is submitted. Mooncake multi-group only. |
+| `layerwise_anchor` | `"attention"` (`"immediate"` for Mooncake) | When a prefetched layer load is released: `"attention"` waits for the attention compute boundary of the previous layer, `"immediate"` releases it as soon as the task is submitted (maximum overlap with the previous layer's compute). |
 | `layerwise_put_exists_filter` | `false` | Before opening a Mooncake put session, drop keys that already exist in the pool (`batch_is_exist`). Costs one extra round trip per chunk but avoids re-writing already pooled objects. |
 | `layerwise_max_transfer_blocks` | `0` (unlimited) | Maximum number of KV blocks per transfer batch. |
 | `layerwise_max_transfer_bytes` | `0` (unlimited) | Maximum bytes in one contiguous transfer segment; larger segments are split. |
@@ -234,7 +234,7 @@ curl -s http://127.0.0.1:9000/v1/completions \
 
 ### Prefetch Depth
 
-Increase `layerwise_prefetch_layers` (default `1`) to prefetch more layers
+Increase `layerwise_prefetch_layers` (default `2` for Mooncake, `1` otherwise) to prefetch more layers
 ahead of the compute frontier. This increases transfer/compute overlap but uses
 more temporary buffers. Typical values: `1–4`.
 
