@@ -52,6 +52,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     _circular_shift,
     _emit_layer_diag,
     _layer_diag_enabled,
+    _LayerEndSessionTask,
     record_failed_blocks,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -214,7 +215,11 @@ class KVPoolWorker:
         # Anchor for prefetched layerwise loads: "attention" releases the transfer
         # at the attention compute boundary (default); "immediate" releases it as
         # soon as the task is submitted (A/B control).
-        anchor = str(extra_config.get("layerwise_anchor", "attention")).lower()
+        # Overlapping the transfer of layer i+1 with the compute of layer i is
+        # the point of layerwise mode, so Mooncake releases the prefetch as soon
+        # as it is submitted instead of waiting for the attention boundary.
+        default_anchor = "immediate" if (self.use_layerwise and self.backend_name == "mooncake") else "attention"
+        anchor = str(extra_config.get("layerwise_anchor", default_anchor)).lower()
         if anchor not in ("attention", "immediate"):
             raise ValueError("layerwise_anchor must be 'attention' or 'immediate'")
         self.layerwise_anchor = anchor
@@ -491,7 +496,11 @@ class KVPoolWorker:
         else:
             self.num_prefetch_layers = 1
             if self.use_layerwise:
-                prefetch_layers = self._extra_config.get("layerwise_prefetch_layers", 1)
+                # One layer of lead keeps the transfer of layer i+1 in flight
+                # while layer i computes; Mooncake needs it more than MemCache
+                # because every range is a remote operation.
+                default_prefetch_layers = 2 if self.backend_name == "mooncake" else 1
+                prefetch_layers = self._extra_config.get("layerwise_prefetch_layers", default_prefetch_layers)
                 if isinstance(prefetch_layers, bool):
                     raise ValueError("layerwise_prefetch_layers must be a positive integer")
                 try:
@@ -1680,27 +1689,35 @@ class KVPoolWorker:
             with self._put_started_keys_lock:
                 self._put_started_keys.difference_update(keys)
 
-    def _end_mooncake_load_keys(self, keys: list[str]) -> None:
-        for key_batch in self._mooncake_key_batches(list(dict.fromkeys(keys))):
-            try:
-                result = self.m_store.batch_get_end(key_batch)
-                if result != 0:
-                    logger.error("Mooncake batch_get_end failed keys=%s result=%s", key_batch, result)
-            except Exception as exc:
-                logger.error("Mooncake batch_get_end raised keys=%s error=%s", key_batch, exc)
-
     def _release_mooncake_requests_for_retry(self, req_ids: set[str]) -> None:
         with self._load_session_lock:
-            self._end_mooncake_load_keys(self._mooncake_session_tracker.release_for_retry(req_ids))
+            keys = self._mooncake_session_tracker.release_for_retry(req_ids)
+        self._queue_mooncake_end_keys(keys)
 
     def _release_mooncake_requests_terminal(self, req_ids: set[str]) -> None:
         with self._load_session_lock:
-            self._end_mooncake_load_keys(self._mooncake_session_tracker.release_terminal(req_ids))
+            keys = self._mooncake_session_tracker.release_terminal(req_ids)
+        self._queue_mooncake_end_keys(keys)
 
     def _release_failed_mooncake_get_attempts(self, request_ids_by_key: dict[str, set[str]]) -> None:
         with self._load_session_lock:
             keys = self._mooncake_session_tracker.release_failed_get_attempts(request_ids_by_key)
-            self._end_mooncake_load_keys(keys)
+        self._queue_mooncake_end_keys(keys)
+
+    def _queue_mooncake_end_keys(self, keys: list[str]) -> None:
+        """Close read sessions on the transfer thread, never on the caller's thread.
+
+        ``batch_get_end`` is a backend round trip on the single-threaded transfer
+        engine. Issuing it from ``wait_for_layer_load``/``get_finished`` would put
+        that round trip on the compute critical path and hold ``_load_session_lock``
+        across a remote call while the recv thread needs the same lock.
+        """
+        keys = list(dict.fromkeys(keys))
+        recv_thread = self.kv_recv_thread
+        if not keys or recv_thread is None:
+            return
+        for key_batch in self._mooncake_key_batches(keys):
+            recv_thread.add_request(_LayerEndSessionTask(tuple(key_batch)))
 
     def _finish_current_mooncake_load_sessions(self) -> None:
         if self.backend_name != "mooncake" or not self.use_layerwise:
@@ -2113,7 +2130,7 @@ class KVPoolWorker:
         for request_identity, request in requests_by_id.items():
             request.load_keys = request_load_keys[request_identity]
         if hybrid_failed_blocks:
-            self._end_mooncake_load_keys(keys)
+            self._queue_mooncake_end_keys(keys)
             raise RuntimeError(
                 "Layerwise multi-group KV load failed and cannot safely fall "
                 "back to per-block recomputation: "

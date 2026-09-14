@@ -28,6 +28,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreLayerRecvingThread,
     KVTransferThread,
     LayerBatchBuilder,
+    _LayerEndSessionTask,
     _build_range_debug_payload,
     _layer_diag_enabled,
 )
@@ -658,6 +659,95 @@ class TestMooncakeRangeMultiGroupBatchedTransfer(unittest.TestCase):
             self.assertTrue(_layer_diag_enabled())
         with patch.dict(os.environ, {"VLLM_ASCEND_KVPOOL_LAYER_DIAG": "0"}):
             self.assertFalse(_layer_diag_enabled())
+
+    def test_timing_diag_reports_overlap_timestamps(self):
+        """Absolute timestamps let us measure transfer/compute overlap offline."""
+        thread = self._make_diag_thread()
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer._layer_diag_enabled",
+                return_value=True,
+            ),
+            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer._emit_layer_diag") as emit,
+        ):
+            self._run_multigroup_load(thread)
+        timing = [p for p in self._diag_payloads(emit) if p.get("event") == "timing"]
+        self.assertEqual(len(timing), 1)
+        self.assertEqual(timing[0]["submit_ts"], 123.0)
+        self.assertGreaterEqual(timing[0]["issue_ts"], timing[0]["submit_ts"])
+        self.assertGreaterEqual(timing[0]["done_ts"], timing[0]["issue_ts"])
+
+
+class TestMooncakeSessionEndOffload(unittest.TestCase):
+    """Read-session close must not run on the compute thread nor under its lock."""
+
+    @staticmethod
+    def _make_worker() -> KVPoolWorker:
+        worker = KVPoolWorker.__new__(KVPoolWorker)
+        worker.backend_name = "mooncake"
+        worker.use_layerwise = True
+        worker.layerwise_max_transfer_blocks = 0
+        worker._load_session_lock = threading.Lock()
+        worker._layer_load_aborted = threading.Event()
+        worker._mooncake_session_tracker = MooncakeSessionTracker()
+        worker.m_store = MagicMock()
+        worker.m_store.batch_get_end.return_value = 0
+        worker.kv_recv_thread = MagicMock()
+        worker._current_mooncake_request_ids = set()
+        worker._current_mooncake_last_chunk_req_ids = set()
+        return worker
+
+    def test_finish_sessions_queues_end_keys_instead_of_calling_backend(self):
+        worker = self._make_worker()
+        worker._mooncake_session_tracker.register_put_keys("r1", [("k1", 0)])
+        worker._mooncake_session_tracker.commit_put_keys(["k1"])
+        worker._mooncake_session_tracker.record_get_result("k1", ["r1"], succeeded=True)
+        worker._current_mooncake_last_chunk_req_ids = {"r1"}
+
+        worker._finish_current_mooncake_load_sessions()
+
+        worker.m_store.batch_get_end.assert_not_called()
+        queued = [call_item.args[0] for call_item in worker.kv_recv_thread.add_request.call_args_list]
+        self.assertEqual([tuple(task.keys) for task in queued], [("k1",)])
+        self.assertEqual(worker._current_mooncake_last_chunk_req_ids, set())
+
+    def test_recv_thread_closes_session_outside_worker_lock(self):
+        worker = self._make_worker()
+        lock_state: list[bool] = []
+        store = MagicMock()
+
+        def record_lock(keys):
+            acquired = worker._load_session_lock.acquire(blocking=False)
+            lock_state.append(acquired)
+            if acquired:
+                worker._load_session_lock.release()
+            return 0
+
+        store.batch_get_end.side_effect = record_lock
+        thread = KVCacheStoreLayerRecvingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            get_event=threading.Event(),
+            layer_load_finished_events=[threading.Event()] * 3,
+            layer_save_finished_events=[threading.Event()] * 3,
+            sync_save_events=[MagicMock()] * 3,
+            num_layers=3,
+        )
+        task = _LayerEndSessionTask(("k1",))
+        thread.request_queue.put(task)
+
+        thread._handle_request(task)
+
+        store.batch_get_end.assert_called_once_with(["k1"])
+        # True means the transfer thread could take the session lock while the
+        # store call was running, i.e. no backend call happens under that lock.
+        self.assertEqual(lock_state, [True])
 
 
 class TestMooncakePrefetchAnchoring(unittest.TestCase):

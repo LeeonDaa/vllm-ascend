@@ -128,6 +128,13 @@ class _LayerRevokeTask:
     keys: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _LayerEndSessionTask:
+    """Close read sessions on the transfer thread instead of the compute thread."""
+
+    keys: tuple[str, ...]
+
+
 class LayerBatchBuilder:
     def __init__(
         self,
@@ -2217,14 +2224,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             raise
         finally:
             if _layer_diag_enabled() and data.submit_ts is not None and issue_ts is not None:
+                done_ts = time.perf_counter()
                 _emit_layer_diag(
                     {
                         "event": "timing",
                         "layer_id": int(layer_id),
                         "gated": data.attention_start_gate is not None,
                         "waited_for_save": data.wait_for_save_layer,
+                        # Absolute timestamps so the log can be used to measure
+                        # transfer/compute overlap without re-deriving offsets.
+                        "submit_ts": data.submit_ts,
+                        "issue_ts": issue_ts,
+                        "done_ts": done_ts,
                         "submit_to_issue_ms": round((issue_ts - data.submit_ts) * 1000, 3),
-                        "issue_to_done_ms": round((time.perf_counter() - issue_ts) * 1000, 3),
+                        "issue_to_done_ms": round((done_ts - issue_ts) * 1000, 3),
                     }
                 )
             if not self.layer_load_finished_events[layer_id].is_set():
@@ -2376,9 +2389,25 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         while time.perf_counter() < deadline:
             pass
 
+    def _handle_end_session(self, data: _LayerEndSessionTask) -> None:
+        """Close read sessions on the transfer thread, never on the compute thread."""
+        keys = list(data.keys)
+        try:
+            if keys:
+                result = self.m_store.batch_get_end(keys)
+                if result != 0:
+                    logger.error("Mooncake batch_get_end failed keys=%s result=%s", keys, result)
+        except Exception as exc:
+            logger.error("Mooncake batch_get_end raised keys=%s error=%s", keys, exc)
+        finally:
+            self.request_queue.task_done()
+
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
     ):
+        if isinstance(data, _LayerEndSessionTask):
+            self._handle_end_session(data)
+            return
         if data.transfer_tasks and data.transfer_tasks[0].use_key_major_ranges:
             self._handle_range_layer_task(data)
             return

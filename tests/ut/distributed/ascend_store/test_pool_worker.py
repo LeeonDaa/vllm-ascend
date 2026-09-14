@@ -359,6 +359,68 @@ class TestKVPoolWorkerInit(unittest.TestCase):
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_pcp_group")
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_tensor_model_parallel_world_size")
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_tensor_model_parallel_rank")
+    def test_mooncake_layerwise_defaults_to_early_release_and_prefetch_two(
+        self, mock_tp_rank, mock_tp_size, mock_pcp_group, mock_dcp_ws, mock_dcp_rank, mock_importlib
+    ):
+        mock_tp_rank.return_value = 0
+        mock_tp_size.return_value = 1
+        pcp_group = MagicMock()
+        pcp_group.world_size = 1
+        mock_pcp_group.return_value = pcp_group
+        mock_dcp_ws.return_value = 1
+        mock_dcp_rank.return_value = 0
+        mock_importlib.import_module.return_value = MagicMock()
+
+        config = self._make_vllm_config(extra_config={"backend": "mooncake"})
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+        worker = KVPoolWorker(config, use_layerwise=True)
+
+        # Overlapping transfer i+1 with compute i needs an early release (no
+        # attention fence) and at least one layer of lead.
+        self.assertEqual(worker.layerwise_anchor, "immediate")
+        self.assertEqual(worker.num_prefetch_layers, 2)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.importlib")
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_decode_context_model_parallel_rank"
+    )
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_decode_context_model_parallel_world_size"
+    )
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_pcp_group")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_tensor_model_parallel_world_size")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_tensor_model_parallel_rank")
+    def test_memcache_layerwise_keeps_attention_gate_default(
+        self, mock_tp_rank, mock_tp_size, mock_pcp_group, mock_dcp_ws, mock_dcp_rank, mock_importlib
+    ):
+        mock_tp_rank.return_value = 0
+        mock_tp_size.return_value = 1
+        pcp_group = MagicMock()
+        pcp_group.world_size = 1
+        mock_pcp_group.return_value = pcp_group
+        mock_dcp_ws.return_value = 1
+        mock_dcp_rank.return_value = 0
+        mock_importlib.import_module.return_value = MagicMock()
+
+        config = self._make_vllm_config(extra_config={"backend": "memcache"})
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+        worker = KVPoolWorker(config, use_layerwise=True)
+
+        # MemCache GVA keeps its attention-anchored release.
+        self.assertEqual(worker.layerwise_anchor, "attention")
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.importlib")
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_decode_context_model_parallel_rank"
+    )
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_decode_context_model_parallel_world_size"
+    )
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_pcp_group")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_tensor_model_parallel_world_size")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_tensor_model_parallel_rank")
     def test_init_mla(self, mock_tp_rank, mock_tp_size, mock_pcp_group, mock_dcp_ws, mock_dcp_rank, mock_importlib):
         mock_tp_rank.return_value = 0
         mock_tp_size.return_value = 1
