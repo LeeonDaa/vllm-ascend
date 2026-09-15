@@ -4,17 +4,24 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.ascend_config import KVPPConfig
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendIndexerKPoolTailSpec,
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
+)
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor, enable_sfa
+
+logger = init_logger(__name__)
 
 # One buffer for the current layer and one for the next layer's prefetch.
 KVPP_SCRATCH_BUFFER_COUNT = 2
@@ -78,6 +85,11 @@ def build_kvpp_buffer_sizes(
                 sizes.append(elements * spec.scale_dim * get_dtype_size(spec.scale_dtype))
         elif isinstance(spec, AscendMLAAttentionSpec) and spec.cache_sparse_sfa_c8:
             sizes.append(spec.page_size_bytes)
+        elif getattr(spec, "model_version", None) == "deepseek_v4":
+            # DeepSeek-V4 pages are consumed whole: the runner carves the
+            # latent/rope, scale and (A5) full views out of one contiguous
+            # per-layer page, and compressed SWA/state pages are already packed.
+            sizes.append(spec.page_size_bytes)
         else:
             dims = list(get_kvpp_attention_kv_dims(vllm_config, name, spec))
             if not enable_sfa(vllm_config) and enable_fa_quant(vllm_config):
@@ -87,6 +99,16 @@ def build_kvpp_buffer_sizes(
             sizes.extend(int(spec.page_size_bytes // factor) for factor in factors)
         result[name] = tuple(sizes)
     return result
+
+
+def is_flat_cache_spec(spec: KVCacheSpec) -> bool:
+    """True when the runner consumes one flat page tensor per cache name.
+
+    DeepSeek-V4 hands every cache a single contiguous page and carves the
+    latent/rope, scale and (A5) full or SWA views out of it, so KVPP must not
+    wrap those pages in a per-component tuple.
+    """
+    return getattr(spec, "model_version", None) == "deepseek_v4"
 
 
 def build_kvpp_layer_layout(
@@ -166,15 +188,29 @@ def create_kvpp_cache_allocation_plan(
 ) -> KVPPPhysicalCachePlan:
     """Keep upstream's logical group while budgeting actual allocations."""
     logical_spec = dict(worker_spec)
-    if (
-        any(not isinstance(spec, FullAttentionSpec) for spec in logical_spec.values())
-        or len({spec.block_size for spec in logical_spec.values()}) > 1
-    ):
-        raise ValueError("KVPP requires one full-attention cache group with a common block size.")
+    unsupported = sorted(name for name, spec in logical_spec.items() if isinstance(spec, AscendIndexerKPoolTailSpec))
+    if unsupported:
+        # The tail cache is request-owned ring state, not a block cache that can
+        # be replaced by another rank's copy.
+        raise ValueError("KVPP does not support request-owned indexer tail caches: " + ", ".join(unsupported[:3]))
+    tensor_sizes = build_kvpp_buffer_sizes(vllm_config, logical_spec)
+    layer_bundles = build_layer_cache_bundles(logical_spec)
+    layer_owner_ranks = map_kvpp_layers_to_owners(vllm_config, logical_spec)
+    spec_layouts = sorted({(type(spec).__name__, spec.block_size) for spec in logical_spec.values()})
+    replicated_layers = sum(1 for name in layer_bundles if name not in layer_owner_ranks)
+    logger.info(
+        "KVPP cache plan: %d layer bundles (%d sharded names, %d replicated layers), "
+        "cache layouts %s, block sizes %s",
+        len(layer_bundles),
+        len(layer_owner_ranks),
+        replicated_layers,
+        [name for name, _ in spec_layouts],
+        sorted({block_size for _, block_size in spec_layouts}),
+    )
     return KVPPPhysicalCachePlan(
         logical_cache_spec=logical_spec,
-        layer_owner_ranks=map_kvpp_layers_to_owners(vllm_config, logical_spec),
-        layer_bundles=build_layer_cache_bundles(logical_spec),
-        tensor_sizes=build_kvpp_buffer_sizes(vllm_config, logical_spec),
+        layer_owner_ranks=layer_owner_ranks,
+        layer_bundles=layer_bundles,
+        tensor_sizes=tensor_sizes,
         kvpp_rank=kvpp_rank,
     )
