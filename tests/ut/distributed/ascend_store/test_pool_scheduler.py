@@ -122,6 +122,27 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(len(queried_keys), 3 * 2)
         self.assertEqual(queried_keys[:2], ["llama-7b@6830@0", "llama-7b@6830@1"])
 
+    def test_mooncake_layerwise_hit_queries_every_kvpp_owner(self):
+        """With KVPP every rank owns a layer shard and saves its own object.
+
+        The hit check must therefore require every owner rank, even when the
+        heads are replicated (put_step > 1 without KVPP).
+        """
+        config = self._make_config(extra_config={"backend": "mooncake", "use_layerwise": True})
+        config.parallel_config.tensor_parallel_size = 4
+        config.model_config.get_total_num_kv_heads.return_value = 1
+        config.additional_config = {"enable_kvpp": True}
+        scheduler = KVPoolScheduler(config, use_layerwise=True)
+        scheduler.store_scheduler.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+        request = MagicMock(request_id="r1", block_hashes=[b"h0", b"h1", b"h2"])
+
+        hit_tokens = scheduler._get_mooncake_layerwise_hit_tokens(request, 48, 0)
+
+        self.assertEqual(hit_tokens, 48)
+        queried_keys = scheduler.store_scheduler.batch_is_exist.call_args.args[0]
+        self.assertEqual(len(queried_keys), 3 * 4)
+        self.assertEqual([key.rpartition("@")[2] for key in queried_keys[:4]], ["0", "1", "2", "3"])
+
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_hit(self, mock_client_cls):
         request = MagicMock(
