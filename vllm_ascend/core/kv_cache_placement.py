@@ -17,6 +17,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
+    AscendSlidingWindowMLASpec,
 )
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor, enable_sfa
@@ -85,13 +86,15 @@ def build_kvpp_buffer_sizes(
                 sizes.append(elements * spec.scale_dim * get_dtype_size(spec.scale_dtype))
         elif isinstance(spec, AscendMLAAttentionSpec) and spec.cache_sparse_sfa_c8:
             sizes.append(spec.page_size_bytes)
-        elif getattr(spec, "model_version", None) == "deepseek_v4":
-            # DeepSeek-V4 pages are consumed whole: the runner carves the
-            # latent/rope, scale and (A5) full views out of one contiguous
-            # per-layer page, and compressed SWA/state pages are already packed.
+        elif is_flat_cache_spec(vllm_config, spec):
+            # Block-strided pages are consumed whole: the runner carves the
+            # latent/rope, scale and full or sliding-window views out of one
+            # contiguous page, so the page is the single KVPP component.
             sizes.append(spec.page_size_bytes)
         else:
             dims = list(get_kvpp_attention_kv_dims(vllm_config, name, spec))
+            if any(dim <= 0 for dim in dims):
+                raise ValueError(f"KVPP cannot size cache {name} ({type(spec).__name__}): dims={dims}")
             if not enable_sfa(vllm_config) and enable_fa_quant(vllm_config):
                 factors = vllm_config.quant_config.get_kv_quant_split_factor(name, dims)
             else:
@@ -101,14 +104,20 @@ def build_kvpp_buffer_sizes(
     return result
 
 
-def is_flat_cache_spec(spec: KVCacheSpec) -> bool:
+def is_flat_cache_spec(vllm_config: VllmConfig, spec: KVCacheSpec) -> bool:
     """True when the runner consumes one flat page tensor per cache name.
 
-    DeepSeek-V4 hands every cache a single contiguous page and carves the
-    latent/rope, scale and (A5) full or SWA views out of it, so KVPP must not
-    wrap those pages in a per-component tuple.
+    Mirrors the runner's block-strided cache layout: compressed models, or cache
+    specs that advertise a block stride, are allocated as one page per layer and
+    the latent/rope, scale and full or sliding-window views are carved out of
+    that page. KVPP must hand those pages over flat instead of per component.
     """
-    return getattr(spec, "model_version", None) == "deepseek_v4"
+    if not isinstance(spec, (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)):
+        return False
+    if getattr(spec, "indexes_kv_by_block_stride", False):
+        return True
+    hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+    return hf_config is not None and hasattr(hf_config, "compress_ratios")
 
 
 def build_kvpp_layer_layout(

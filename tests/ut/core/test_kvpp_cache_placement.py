@@ -121,7 +121,7 @@ def test_multigroup_block_sizes_are_supported():
 
 def test_dsv4_hybrid_specs_use_one_page_per_cache():
     """DeepSeek-V4 pages stay whole; the runner splits them per view."""
-    swa_layers, indexer = layer_name(1), indexer_name(1)
+    swa_layers, indexer, state = layer_name(1), indexer_name(1), "model.layers.1.self_attn.state"
     swa = AscendSlidingWindowMLASpec(
         block_size=64,
         num_kv_heads=1,
@@ -129,6 +129,15 @@ def test_dsv4_hybrid_specs_use_one_page_per_cache():
         dtype=torch.float8_e4m3fn,
         sliding_window=128,
         model_version="deepseek_v4",
+    )
+    # The compressor state spec carries no model_version, only packed pages.
+    compressor_state = AscendSlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float8_e4m3fn,
+        sliding_window=32,
+        page_size_padded=64 * 64,
     )
     compressed = AscendMLAAttentionSpec(
         block_size=256,
@@ -139,24 +148,42 @@ def test_dsv4_hybrid_specs_use_one_page_per_cache():
         scale_dtype=torch.float16,
         model_version="deepseek_v4",
     )
-    specs = {swa_layers: swa, indexer: compressed}
+    specs = {swa_layers: swa, state: compressor_state, indexer: compressed}
     config = make_kvpp_config(2)
+    config.model_config.hf_config.compress_ratios = [1, 4, 128]
 
     assert placement.build_kvpp_buffer_sizes(config, specs) == {
         swa_layers: (swa.page_size_bytes,),
+        state: (compressor_state.page_size_bytes,),
         indexer: (compressed.page_size_bytes,),
     }
 
     plan = placement.create_kvpp_cache_allocation_plan(config, specs, kvpp_rank=0)
-    # Both caches of one layer belong to the same owner and share one bundle.
-    assert plan.layer_bundles == {swa_layers: (swa_layers, indexer)}
-    assert plan.layer_owner_ranks == {swa_layers: 0, indexer: 0}
+    # Every cache of one layer belongs to the same owner and shares one bundle.
+    assert plan.layer_bundles == {swa_layers: (swa_layers, indexer, state)}
+    assert plan.layer_owner_ranks == {swa_layers: 0, state: 0, indexer: 0}
     # The runner takes these pages flat instead of a per-component tuple.
-    assert placement.is_flat_cache_spec(swa)
-    assert placement.is_flat_cache_spec(compressed)
-    assert not placement.is_flat_cache_spec(make_kvpp_specs()[layer_name(9)])
-    _, size = placement.build_kvpp_layer_layout((swa_layers, indexer), plan.tensor_sizes, num_blocks=8)
-    assert size == 8 * (swa.page_size_bytes + compressed.page_size_bytes)
+    assert placement.is_flat_cache_spec(config, swa)
+    assert placement.is_flat_cache_spec(config, compressor_state)
+    assert placement.is_flat_cache_spec(config, compressed)
+    _, size = placement.build_kvpp_layer_layout((swa_layers, indexer, state), plan.tensor_sizes, num_blocks=8)
+    assert size == 8 * (swa.page_size_bytes + compressor_state.page_size_bytes + compressed.page_size_bytes)
+
+
+def test_models_without_compression_keep_per_component_caches():
+    """Non-compressed models keep their previous sizing and tuple layout."""
+    spec = AscendSlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=192,
+        dtype=torch.float8_e4m3fn,
+        sliding_window=128,
+    )
+    config = make_kvpp_config(2)
+
+    assert not placement.is_flat_cache_spec(config, spec)
+    with pytest.raises(ValueError, match="cannot size cache"):
+        placement.build_kvpp_buffer_sizes(config, {layer_name(1): spec})
 
 
 def test_request_owned_tail_caches_are_rejected():
