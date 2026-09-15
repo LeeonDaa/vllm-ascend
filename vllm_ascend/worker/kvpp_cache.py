@@ -55,7 +55,7 @@ def allocate_kvpp_cache(
             tensors = tuple(buffer.narrow(0, offset, length) for offset, length in parts)
             # DeepSeek-V4 views one flat page per cache name; every other layout
             # keeps the per-component tuple the runner expects.
-            if len(tensors) == 1 and is_flat_cache_spec(plan.logical_cache_spec[cache_name]):
+            if len(tensors) == 1 and is_flat_cache_spec(vllm_config, plan.logical_cache_spec[cache_name]):
                 caches[cache_name] = tensors[0]
             else:
                 caches[cache_name] = tensors
