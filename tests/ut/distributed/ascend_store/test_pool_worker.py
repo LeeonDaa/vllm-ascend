@@ -138,6 +138,42 @@ class TestKVPPPoolWorker(unittest.TestCase):
         self.assertEqual(worker._local_group_layers(17), [(0, 1)])
         self.assertEqual(worker._local_group_layers(10), [])
 
+    def test_layerwise_threads_use_the_rank_last_stored_layer(self):
+        """Load completion and lease release follow the rank's own last layer."""
+        import torch
+
+        from tests.ut.kvpp_utils import layer_name, make_kvpp_config
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+            KVTransferThread,
+        )
+
+        for use_kvpp in (True, False):
+            with self.subTest(use_kvpp=use_kvpp):
+                worker = make_worker(
+                    self,
+                    tp_rank=0,
+                    tp_size=2,
+                    num_layers=24,
+                    use_mla=True,
+                    use_kvpp=use_kvpp,
+                    use_layerwise=True,
+                )
+                worker.vllm_config = make_kvpp_config(2)
+                names = [layer_name(i) for i in (9, 10, 17)]
+                caches = {name: torch.zeros((4, 16, 8)) for name in names}
+                with patch.object(KVTransferThread, "start", lambda thread: thread.ready_event.set()):
+                    worker.register_kv_caches(caches)
+
+                if use_kvpp:
+                    # KVPP keeps the stage layer count and completion follows
+                    # the last layer this rank stores.
+                    self.assertEqual(worker.num_layers, 24)
+                    self.assertEqual(worker.kv_recv_thread.final_layer_id, 17)
+                    self.assertEqual(worker.kv_send_thread.final_layer_id, 17)
+                else:
+                    self.assertEqual(worker.kv_recv_thread.final_layer_id, worker.num_layers - 1)
+                    self.assertEqual(worker.kv_send_thread.final_layer_id, worker.num_layers - 1)
+
     def test_lookup_requires_every_tp_shard(self):
         worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True)
         for exists, expected in (([1, 1, 1, 1], 32), ([1, 1, 1, 0], 16), ([1, 1, 0, 0], 0)):
@@ -1205,6 +1241,24 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         worker.group_layer_local_index = {0: {2: 0, 6: 1}}
         self.assertEqual(worker._local_group_layers(2), [(0, 2)])
         self.assertEqual(worker._local_group_layers(4), [(0, 4)])
+
+    def test_last_stored_layer_follows_owned_layers_under_kvpp(self):
+        worker = self._make_worker()
+        worker.num_layers = 8
+        worker.local_physical_layers = {2, 6}
+
+        worker.use_kvpp = False
+        self.assertEqual(worker._last_stored_layer_id(), 7)
+
+        worker.use_kvpp = True
+        self.assertEqual(worker._last_stored_layer_id(), 6)
+
+    def test_last_stored_layer_is_model_last_layer_without_registered_layers(self):
+        worker = self._make_worker()
+        worker.num_layers = 8
+        worker.use_kvpp = True
+
+        self.assertEqual(worker._last_stored_layer_id(), 7)
 
     def test_empty_layerwise_step_reowns_task_lists(self):
         worker = self._make_worker()
