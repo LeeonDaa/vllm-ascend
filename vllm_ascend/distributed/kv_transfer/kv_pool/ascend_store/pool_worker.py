@@ -1184,6 +1184,7 @@ class KVPoolWorker:
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
                     use_key_major_ranges=(self.use_block_key_layerwise and self.backend_name == "mooncake"),
+                    layer_idx_is_local=getattr(self, "use_kvpp", False),
                 )
             )
 
@@ -1294,6 +1295,7 @@ class KVPoolWorker:
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
                     use_key_major_ranges=(self.use_block_key_layerwise and self.backend_name == "mooncake"),
+                    layer_idx_is_local=getattr(self, "use_kvpp", False),
                 )
             )
 
@@ -2177,6 +2179,8 @@ class KVPoolWorker:
         returned index addresses the entries that were registered for the
         layer, which is what the block object's byte ranges are built from.
         """
+        if not getattr(self, "use_kvpp", False):
+            return self.physical_layer_to_group_layers.get(physical_layer, [(0, physical_layer)])
         if self.local_physical_layers and physical_layer not in self.local_physical_layers:
             return []
         group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, physical_layer)])
