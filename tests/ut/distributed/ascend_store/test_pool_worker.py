@@ -1192,10 +1192,16 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         for layer_tasks in worker.layer_load_tasks:
             self.assertEqual(layer_tasks, [])
 
-    def test_local_group_layers_keeps_layer_id_without_registered_layout(self):
+    def test_local_group_layers_keeps_layer_id_without_kvpp(self):
         worker = self._make_worker()
 
         self.assertEqual(worker._local_group_layers(3), [(0, 3)])
+
+        # KVPP sharding bookkeeping must not change the result while off.
+        worker.local_physical_layers = {2, 6}
+        worker.group_layer_local_index = {0: {2: 0, 6: 1}}
+        self.assertEqual(worker._local_group_layers(2), [(0, 2)])
+        self.assertEqual(worker._local_group_layers(4), [(0, 4)])
 
     def test_empty_layerwise_step_reowns_task_lists(self):
         worker = self._make_worker()

@@ -107,6 +107,7 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
             layer_idx_in_group=1,
             block_ranges=[LayerBlockRange(request, 0, 1)],
             use_key_major_ranges=True,
+            layer_idx_is_local=True,
         )
         builder = LayerBatchBuilder(make_token_database(), page_size_bytes=60, num_layers=2)
 
@@ -118,6 +119,28 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
         self.assertEqual(result.all_buffers, [[3600]])
         self.assertEqual(result.all_sizes, [[30]])
         self.assertEqual(result.all_offsets, [[30]])
+
+    def test_key_major_ranges_keep_layer_id_without_kvpp(self):
+        """Without KVPP the block key is still addressed by the layer id.
+
+        Turning KVPP on shards layers across ranks, but configurations that
+        do not enable it must behave exactly as before.
+        """
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[])
+        request.save_block_keys = ["key"]
+        task = LayerTransferTask(
+            layer_id=1,
+            layer_idx_in_group=0,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+        )
+        builder = LayerBatchBuilder(make_token_database(), page_size_bytes=60, num_layers=2)
+
+        result = builder.build(task)
+
+        assert isinstance(result, LayerRangeReqMeta)
+        # layer_id=1 selects the object's second entry group, as before.
+        self.assertEqual(result.all_buffers, [[3600]])
 
     def test_range_limits_split_rows_and_large_segments(self):
         batches = KVTransferThread._range_transfer_batches(

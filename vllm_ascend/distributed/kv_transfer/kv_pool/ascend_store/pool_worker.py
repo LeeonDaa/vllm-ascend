@@ -1299,6 +1299,7 @@ class KVPoolWorker:
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
                     use_key_major_ranges=(self.use_block_key_layerwise and self.backend_name == "mooncake"),
+                    layer_idx_is_local=getattr(self, "use_kvpp", False),
                 )
             )
 
@@ -1409,6 +1410,7 @@ class KVPoolWorker:
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
                     use_key_major_ranges=(self.use_block_key_layerwise and self.backend_name == "mooncake"),
+                    layer_idx_is_local=getattr(self, "use_kvpp", False),
                 )
             )
 
