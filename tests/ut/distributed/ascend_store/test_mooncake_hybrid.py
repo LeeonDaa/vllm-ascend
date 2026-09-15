@@ -235,7 +235,10 @@ class TestMooncakeHybrid(unittest.TestCase):
     def test_layout_fingerprint_covers_group_membership_and_dtype(self):
         config = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(["model.layers.0.kv"], FullAttentionSpec(block_size=16, dtype="uint8")),
+                KVCacheGroupSpec(
+                    ["model.layers.0.kv"],
+                    FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+                ),
             ]
         )
         original = hybrid_layout_id(config)
@@ -243,7 +246,9 @@ class TestMooncakeHybrid(unittest.TestCase):
         config.kv_cache_groups[0].layer_names.append("model.layers.1.kv")
         self.assertNotEqual(original, hybrid_layout_id(config))
         config.kv_cache_groups[0].layer_names.pop()
-        config.kv_cache_groups[0].kv_cache_spec = FullAttentionSpec(block_size=16, dtype="float16")
+        config.kv_cache_groups[0].kv_cache_spec = FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=1, dtype="float16"
+        )
         self.assertNotEqual(original, hybrid_layout_id(config))
 
     def test_attention_window_drains_before_communication_and_on_exception(self):
@@ -472,9 +477,15 @@ class TestMooncakeHybrid(unittest.TestCase):
     def test_shared_coordinator_requires_reachable_state_in_all_groups(self):
         group_config = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(["model.layers.0.kv"], FullAttentionSpec(block_size=16, dtype="uint8")),
                 KVCacheGroupSpec(
-                    ["model.layers.1.state"], SlidingWindowSpec(block_size=16, sliding_window=16, dtype="uint8")
+                    ["model.layers.0.kv"],
+                    FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+                ),
+                KVCacheGroupSpec(
+                    ["model.layers.1.state"],
+                    SlidingWindowSpec(
+                        block_size=16, sliding_window=16, num_kv_heads=1, head_size=1, dtype="uint8"
+                    ),
                 ),
             ]
         )
