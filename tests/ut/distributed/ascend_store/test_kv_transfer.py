@@ -31,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LayerLoadTask,
     LayerBatchReqMeta,
     LayerPoolKey,
+    LayerRangeReqMeta,
     LayerTransferTask,
     LoadSpec,
     ReqMeta,
@@ -297,14 +298,14 @@ class TestGVALayerTransferFailures(unittest.TestCase):
 
 
 class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
-    def _make_thread(self, external_slot_release_waiter=None, save_failure_checker=None):
+    def _make_thread(self, external_slot_release_waiter=None, save_failure_checker=None, num_layers=2, final_layer_id=None):
         # Plain mock store: the layerwise threads are backend-agnostic.
         # `.store` is attached explicitly to pin batch_copy's return value.
         store = MagicMock()
         store.store = MagicMock(batch_copy=MagicMock(return_value=0))
-        load_finished = [threading.Event(), threading.Event()]
-        save_finished = [threading.Event(), threading.Event()]
-        sync_events = [MagicMock(), MagicMock()]
+        load_finished = [threading.Event() for _ in range(num_layers)]
+        save_finished = [threading.Event() for _ in range(num_layers)]
+        sync_events = [MagicMock() for _ in range(num_layers)]
         builder = MagicMock()
         builder.build_addrs.return_value = LayerBatchReqMeta(
             req_ids=["r1"],
@@ -327,12 +328,68 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
             layer_load_finished_events=load_finished,
             layer_save_finished_events=save_finished,
             sync_save_events=sync_events,
-            num_layers=2,
+            num_layers=num_layers,
+            final_layer_id=final_layer_id,
             group_builders=[builder],
             external_slot_release_waiter=external_slot_release_waiter,
             save_failure_checker=save_failure_checker,
         )
         return thread, load_finished, save_finished, sync_events
+
+    def test_layer_thread_honours_rank_final_layer(self):
+        thread, _, _, _ = self._make_thread(num_layers=8)
+        self.assertEqual(thread.final_layer_id, 7)
+
+        thread, _, _, _ = self._make_thread(num_layers=8, final_layer_id=4)
+        self.assertEqual(thread.final_layer_id, 4)
+
+    def test_range_load_finishes_request_at_rank_final_layer(self):
+        """A KVPP rank owns a layer subset, so its load completes the request
+        at its own last stored layer instead of the model's last layer."""
+        thread, _, _, _ = self._make_thread(num_layers=8, final_layer_id=4)
+        thread.m_store.batch_copy_get.return_value = [16]
+        shared = SharedBlockData(
+            block_ids_arr=np.asarray([0]),
+            block_gvas_arr=None,
+            req_ids=["r1"],
+            is_last_chunks=[True],
+        )
+        req_meta = LayerRangeReqMeta(
+            req_ids=["r1"],
+            layer_id=4,
+            block_ids=[0],
+            keys=["key"],
+            all_buffers=[[100]],
+            all_sizes=[[16]],
+            all_offsets=[[0]],
+        )
+
+        thread._handle_range_request(req_meta, shared)
+
+        self.assertEqual(thread.get_and_clear_finished_requests(), {"r1"})
+
+    def test_range_load_keeps_request_open_before_rank_final_layer(self):
+        thread, _, _, _ = self._make_thread(num_layers=8, final_layer_id=4)
+        thread.m_store.batch_copy_get.return_value = [16]
+        shared = SharedBlockData(
+            block_ids_arr=np.asarray([0]),
+            block_gvas_arr=None,
+            req_ids=["r1"],
+            is_last_chunks=[True],
+        )
+        req_meta = LayerRangeReqMeta(
+            req_ids=["r1"],
+            layer_id=3,
+            block_ids=[0],
+            keys=["key"],
+            all_buffers=[[100]],
+            all_sizes=[[16]],
+            all_offsets=[[0]],
+        )
+
+        thread._handle_range_request(req_meta, shared)
+
+        self.assertEqual(thread.get_and_clear_finished_requests(), set())
 
     def test_handle_request_does_not_clear_worker_owned_tasks(self):
         thread, _, _, _ = self._make_thread()

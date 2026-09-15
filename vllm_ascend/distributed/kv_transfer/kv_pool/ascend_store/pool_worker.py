@@ -574,6 +574,7 @@ class KVPoolWorker:
                     put_started_keys=self._put_started_keys,
                     put_started_keys_lock=self._put_started_keys_lock,
                     session_tracker=self._mooncake_session_tracker if self.backend_name == "mooncake" else None,
+                    final_layer_id=self._last_stored_layer_id(),
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -621,6 +622,7 @@ class KVPoolWorker:
                     invalid_block_ids=self._invalid_block_ids,
                     invalid_block_ids_lock=self._invalid_block_ids_lock,
                     load_abort_event=self._layer_load_aborted,
+                    final_layer_id=self._last_stored_layer_id(),
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -2220,6 +2222,18 @@ class KVPoolWorker:
             for group_id, layer_idx_in_group in group_layers
         ]
 
+    def _last_stored_layer_id(self) -> int:
+        """Last layer this rank stores.
+
+        Request completion, lease release and session teardown are keyed on the
+        final layer of the rank's own layer stack: KVPP shards layers across
+        ranks, so the model's last layer is not stored here. Without KVPP the
+        rank stores the whole stack and this is the model's last layer.
+        """
+        if getattr(self, "use_kvpp", False) and self.local_physical_layers:
+            return max(self.local_physical_layers)
+        return self.num_layers - 1
+
     def _check_hybrid_load_errors(self) -> None:
         # A hybrid block ID can belong to SWA, compressed KV or compressor
         # state. Do not feed partially restored state to the attention kernel.
@@ -2337,7 +2351,7 @@ class KVPoolWorker:
                 self._finish_current_mooncake_load_sessions()
             raise
         self.layer_load_finished_events[self.current_layer].clear()
-        if getattr(self, "mooncake_hybrid", False) and self.current_layer == self.num_layers - 1:
+        if getattr(self, "mooncake_hybrid", False) and self.current_layer == self._last_stored_layer_id():
             # The final model layer can have no reachable load rows. Completion
             # belongs to the whole request, not whichever group happens to end here.
             for req_id in self._current_mooncake_last_chunk_req_ids:
@@ -2345,7 +2359,7 @@ class KVPoolWorker:
         if (
             getattr(self, "backend_name", None) == "mooncake"
             and getattr(self, "use_block_key_layerwise", False)
-            and (self._layer_load_aborted.is_set() or self.current_layer == self.num_layers - 1)
+            and (self._layer_load_aborted.is_set() or self.current_layer == self._last_stored_layer_id())
         ):
             self._finish_current_mooncake_load_sessions()
         if hasattr(self, "kv_role") and not is_kv_save_role(self.kv_role, getattr(self, "consumer_is_to_put", False)):
