@@ -22,9 +22,15 @@ It does not translate Mooncake operations into Memcache GVA operations.
 - This patch wires compute windows into the Ascend DSA, FA, and SFA attention
   paths. Start validation in eager mode. Graph-mode execution and additional
   attention backends require separate integration validation.
-- PP, DCP, PCP, and prefill/decode TP mismatch retain the restrictions of the
-  upstream-main Mooncake layerwise implementation. This branch does not include
-  the independent PP/DCP adaptation.
+- PP and DCP use the global layer addressing of the upstream-main Mooncake
+  layerwise implementation, so both stages of a PP deployment share one layer
+  key space. PCP and prefill/decode TP mismatch retain the restrictions of that
+  implementation.
+- KV layer parallelism (`enable_kvpp`) is supported. Each rank stores a shard of
+  the stage's target layers plus its own MTP caches, and pooling restores those
+  same buffers, so producer and consumer must run the same KVPP group size and
+  layer layout. See [KVPP](kvpp.md) for the surrounding constraints; PCP
+  remains unsupported for pooling.
 - Recurrent Mamba state is explicitly rejected. Hybrid attention and hybrid
   recurrent/linear-attention state are not interchangeable.
 - Only complete, coordinator-aligned block snapshots are published. Partial
