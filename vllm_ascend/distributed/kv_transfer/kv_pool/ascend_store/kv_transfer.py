@@ -1567,6 +1567,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         put_started_keys: set[str] | None = None,
         put_started_keys_lock: threading.Lock | None = None,
         session_tracker: MooncakeSessionTracker | None = None,
+        final_layer_id: int | None = None,
     ):
         super().__init__(
             m_store,
@@ -1578,7 +1579,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreLayerSendingThread",
         )
-        self.final_layer_id = num_layers - 1
+        self.final_layer_id = num_layers - 1 if final_layer_id is None else final_layer_id
         self.layer_save_finished_events = layer_save_finished_events
         self.sync_save_events = sync_save_events
         self.max_transfer_blocks = max_transfer_blocks
@@ -1843,6 +1844,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         invalid_block_ids: set[int] | None = None,
         invalid_block_ids_lock: threading.Lock | None = None,
         load_abort_event: threading.Event | None = None,
+        final_layer_id: int | None = None,
     ):
         super().__init__(
             m_store,
@@ -1858,7 +1860,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
         self.sync_save_events = sync_save_events
-        self.final_layer_id = num_layers - 1
+        self.final_layer_id = num_layers - 1 if final_layer_id is None else final_layer_id
         self.h2d_stagger_us = h2d_stagger_us
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
