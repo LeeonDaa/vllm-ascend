@@ -54,6 +54,7 @@ def make_worker(
     enable_kv_events=False,
     num_hidden_layers=None,
     use_kvpp=False,
+    kv_cache_config=None,
 ):
     module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
     start_patch(test, f"{module}.get_tensor_model_parallel_rank", return_value=tp_rank)
@@ -85,6 +86,8 @@ def make_worker(
         "backend": "mooncake",
         **(extra_config or {}),
     }
+    if kv_cache_config is not None:
+        config.scheduler_config.disable_hybrid_kv_cache_manager = False
     config.cache_config.block_size = 16
     config.kv_events_config = None
     if enable_kv_events:
@@ -92,7 +95,7 @@ def make_worker(
 
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
-    return KVPoolWorker(config, use_layerwise=use_layerwise)
+    return KVPoolWorker(config, use_layerwise=use_layerwise, kv_cache_config=kv_cache_config)
 
 
 class TestKVPPPoolWorker(unittest.TestCase):
