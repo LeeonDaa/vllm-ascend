@@ -426,6 +426,49 @@ class TestMooncakeHybrid(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             worker.wait_for_layer_load()
 
+    def _make_hybrid_scheduler(self, *, tp_size, num_kv_heads, use_kvpp):
+        group_config = SimpleNamespace(
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["model.layers.0.kv"],
+                    FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+                ),
+                KVCacheGroupSpec(
+                    ["model.layers.1.state"],
+                    SlidingWindowSpec(
+                        block_size=16, num_kv_heads=1, head_size=1, sliding_window=16, dtype="uint8"
+                    ),
+                ),
+            ]
+        )
+        config = scheduler_tests.make_config(block_size=32)
+        config.cache_config.prefix_match_unit = 16
+        config.scheduler_config.disable_hybrid_kv_cache_manager = False
+        config.parallel_config.tensor_parallel_size = tp_size
+        config.model_config.get_total_num_kv_heads.return_value = num_kv_heads
+        config.additional_config = {"enable_kvpp": use_kvpp}
+        with (
+            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient"),
+            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.importlib"),
+        ):
+            return KVPoolScheduler(config, kv_cache_config=group_config, use_layerwise=True)
+
+    def test_hybrid_hit_check_queries_every_kvpp_owner(self):
+        """KVPP shards layers per rank, so every owner stores its own object."""
+        scheduler = self._make_hybrid_scheduler(tp_size=4, num_kv_heads=2, use_kvpp=True)
+
+        keys = scheduler._make_layerwise_hit_check_keys(0, "blockhash")
+
+        self.assertEqual([key.rpartition("@")[2] for key in keys], ["0", "1", "2", "3"])
+
+    def test_hybrid_hit_check_keeps_published_rank_count_without_kvpp(self):
+        scheduler = self._make_hybrid_scheduler(tp_size=4, num_kv_heads=2, use_kvpp=False)
+
+        keys = scheduler._make_layerwise_hit_check_keys(0, "blockhash")
+
+        # Two replicated KV-head groups publish one object each.
+        self.assertEqual([key.rpartition("@")[2] for key in keys], ["0", "1"])
+
     def test_shared_coordinator_requires_reachable_state_in_all_groups(self):
         group_config = SimpleNamespace(
             kv_cache_groups=[

@@ -383,7 +383,8 @@ class KVPoolScheduler:
         A block is a hit only when every PP stage has saved it, so the
         protocol helper enumerates all stages and head/TP ranks.
         """
-        head_or_tp_ranks = self.tp_size // self.put_step
+        # KVPP shards layers per rank: every owner publishes its own object.
+        head_or_tp_ranks = self.tp_size if getattr(self, "use_kvpp", False) else self.tp_size // self.put_step
         if self.mooncake_hybrid:
             return [
                 hybrid_block_key(
