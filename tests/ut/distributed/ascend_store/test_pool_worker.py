@@ -117,6 +117,24 @@ class TestKVPPPoolWorker(unittest.TestCase):
                 self.assertEqual(worker.head_or_tp_rank, rank)
                 self.assertEqual(worker.put_step, 1)
 
+    def test_layerwise_layer_entries_follow_owned_layers(self):
+        """Layerwise entries address the layers this KVPP rank stores."""
+        import torch
+
+        from tests.ut.kvpp_utils import layer_name, make_kvpp_config
+
+        worker = make_worker(self, tp_rank=0, tp_size=2, num_layers=18, use_mla=True, use_kvpp=True)
+        worker.vllm_config = make_kvpp_config(2)
+        worker._transfer_threads_started = True
+        names = [layer_name(i) for i in (9, 10, 17)]
+        worker.register_kv_caches({name: torch.zeros((4, 16, 8)) for name in names})
+
+        # Rank 0 owns layer 9 and keeps the replicated MTP layer 17; layer 10
+        # belongs to rank 1 and has no entries here.
+        self.assertEqual(worker._local_group_layers(9), [(0, 0)])
+        self.assertEqual(worker._local_group_layers(17), [(0, 1)])
+        self.assertEqual(worker._local_group_layers(10), [])
+
     def test_lookup_requires_every_tp_shard(self):
         worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True)
         for exists, expected in (([1, 1, 1, 1], 32), ([1, 1, 1, 0], 16), ([1, 1, 0, 0], 0)):
@@ -1173,6 +1191,11 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             self.assertEqual(layer_tasks, [])
         for layer_tasks in worker.layer_load_tasks:
             self.assertEqual(layer_tasks, [])
+
+    def test_local_group_layers_keeps_layer_id_without_registered_layout(self):
+        worker = self._make_worker()
+
+        self.assertEqual(worker._local_group_layers(3), [(0, 3)])
 
     def test_empty_layerwise_step_reowns_task_lists(self):
         worker = self._make_worker()

@@ -93,6 +93,32 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
         self.assertEqual(result.all_sizes, [[30]])
         self.assertEqual(result.all_offsets, [[30]])
 
+    def test_key_major_ranges_use_local_layer_index(self):
+        """A KVPP-sharded rank stores only the layers it owns, compactly.
+
+        Layer 12 is this rank's second local layer, so its ranges are the
+        second entry group of the block object rather than an index derived
+        from the rank-global layer id.
+        """
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[])
+        request.save_block_keys = ["key"]
+        task = LayerTransferTask(
+            layer_id=12,
+            layer_idx_in_group=1,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+        )
+        builder = LayerBatchBuilder(make_token_database(), page_size_bytes=60, num_layers=2)
+
+        result = builder.build(task)
+
+        self.assertIsInstance(result, LayerRangeReqMeta)
+        assert isinstance(result, LayerRangeReqMeta)
+        self.assertEqual(result.keys, ["key"])
+        self.assertEqual(result.all_buffers, [[3600]])
+        self.assertEqual(result.all_sizes, [[30]])
+        self.assertEqual(result.all_offsets, [[30]])
+
     def test_range_limits_split_rows_and_large_segments(self):
         batches = KVTransferThread._range_transfer_batches(
             ["k0", "k1"],
