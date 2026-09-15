@@ -79,7 +79,7 @@ KVPP broadcasts each full layer once. No broadcast granularity or separate KVPP 
 | Speculative decoding | Fixed-step MTP; variable-step MTP and other speculative decoding methods are not supported |
 | Execution mode | Eager mode only; graph execution is not supported |
 | Context parallelism | PCP requires Model Runner V2; DCP is not supported |
-| KV pooling | Memcache with `AscendStoreConnector`, `kv_producer`, asynchronous whole-block loading; PCP disabled |
+| KV pooling | Memcache with `AscendStoreConnector` and `kv_producer`/asynchronous whole-block loading, plus Mooncake layerwise pooling (`use_layerwise=true`); PCP disabled |
 | PD disaggregation | `MooncakeConnectorV2`; enable KVPP on the prefill node only; PCP disabled |
 
 Feature combinations must also meet the requirements of the model and the individual features.
@@ -106,9 +106,11 @@ Configure the memcache SDK and MetaService as described in [KV Pool](kv_pool.md)
 --kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_producer","kv_connector_extra_config":{"lookup_rpc_port":"0","backend":"memcache","use_layerwise":false,"load_async":true}}'
 ```
 
-This role both saves and loads pooled prefixes. Keep `discard_partial_chunks=true` (the default). Layerwise pooling, KV events, `kv_consumer`, `kv_both`, and consumer write-back are not supported with KVPP.
+This role both saves and loads pooled prefixes. Keep `discard_partial_chunks=true` (the default). KV events, `kv_consumer`, `kv_both`, and consumer write-back are not supported with KVPP.
 
 Each TP rank saves one complete object per token block containing its persistent target layers and its own MTP caches. Scratch buffers are excluded. Loading restores those same persistent buffers; the existing KVPP broadcast supplies other ranks when a layer executes. Pool lookup requires every nonempty owner shard across all PP stages.
+
+The Mooncake layerwise backend follows the same owner-per-rank contract: the objects published by a rank hold that rank's layer shard, addressed by the rank's own registered layer layout, and a prefix counts as a pool hit only when every owner shard has committed it. Run the same KVPP group size and layer layout on producer and consumer, as with whole-block pooling. Hybrid (multi-group) layerwise layouts are supported; see the [Mooncake layerwise hybrid attention guide](mooncake_hybrid_attention.md).
 
 ## Performance
 
