@@ -9,7 +9,12 @@ from vllm.model_executor.layers.attention import MLAAttention
 from tests.ut.kvpp_utils import indexer_name, layer_name, make_kvpp_config, make_kvpp_specs
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core import kv_cache_placement as placement
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendIndexerKPoolStateSpec,
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
+    AscendSlidingWindowMLASpec,
+)
 
 
 @pytest.mark.parametrize("tp,pcp,expected", [(2, 2, 4), (4, 2, 8)])
@@ -100,6 +105,74 @@ def test_unquantized_indexer_and_quantized_mla_sizes(monkeypatch):
     monkeypatch.setattr(placement, "enable_fa_quant", lambda _: True)
     assert placement.build_kvpp_buffer_sizes(config, specs) == {main: (16, 16), indexer: (16,)}
     config.quant_config.get_kv_quant_split_factor.assert_called_once_with(main, [8, 4])
+
+
+def test_multigroup_block_sizes_are_supported():
+    """Hybrid layouts mix block sizes; each cache is still sized per layout."""
+    specs = make_kvpp_specs()
+    wide = layer_name(9)
+    specs[wide] = replace(specs[wide], block_size=4)
+
+    plan = placement.create_kvpp_cache_allocation_plan(make_kvpp_config(2), specs, kvpp_rank=0)
+
+    assert plan.tensor_sizes[wide] == placement.build_kvpp_buffer_sizes(make_kvpp_config(2), {wide: specs[wide]})[wide]
+    assert plan.layer_owner_ranks[wide] == 0
+
+
+def test_dsv4_hybrid_specs_use_one_page_per_cache():
+    """DeepSeek-V4 pages stay whole; the runner splits them per view."""
+    swa_layers, indexer = layer_name(1), indexer_name(1)
+    swa = AscendSlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=192,
+        dtype=torch.float8_e4m3fn,
+        sliding_window=128,
+        model_version="deepseek_v4",
+    )
+    compressed = AscendMLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        scale_dim=1,
+        scale_dtype=torch.float16,
+        model_version="deepseek_v4",
+    )
+    specs = {swa_layers: swa, indexer: compressed}
+    config = make_kvpp_config(2)
+
+    assert placement.build_kvpp_buffer_sizes(config, specs) == {
+        swa_layers: (swa.page_size_bytes,),
+        indexer: (compressed.page_size_bytes,),
+    }
+
+    plan = placement.create_kvpp_cache_allocation_plan(config, specs, kvpp_rank=0)
+    # Both caches of one layer belong to the same owner and share one bundle.
+    assert plan.layer_bundles == {swa_layers: (swa_layers, indexer)}
+    assert plan.layer_owner_ranks == {swa_layers: 0, indexer: 0}
+    # The runner takes these pages flat instead of a per-component tuple.
+    assert placement.is_flat_cache_spec(swa)
+    assert placement.is_flat_cache_spec(compressed)
+    assert not placement.is_flat_cache_spec(make_kvpp_specs()[layer_name(9)])
+    _, size = placement.build_kvpp_layer_layout((swa_layers, indexer), plan.tensor_sizes, num_blocks=8)
+    assert size == 8 * (swa.page_size_bytes + compressed.page_size_bytes)
+
+
+def test_request_owned_state_caches_are_rejected():
+    """Request-owned indexer state cannot be replaced by another rank's copy."""
+    state = AscendIndexerKPoolStateSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+        sliding_window=128,
+    )
+
+    with pytest.raises(ValueError, match="state caches"):
+        placement.create_kvpp_cache_allocation_plan(
+            make_kvpp_config(2), {"model.layers.1.indexer.state": state}, kvpp_rank=0
+        )
 
 
 @pytest.mark.parametrize("tp,rank,cost", [(3, 0, 404), (3, 1, 392), (3, 2, 328), (10, 9, 248)])

@@ -2,7 +2,7 @@
 
 ## Overview
 
-KVPP (KV pipeline parallelism) distributes historical KV caches that would otherwise be replicated across TP ranks by layer for non-hybrid MLA/SFA models. This reduces persistent cache storage per rank, allowing the same HBM capacity to accommodate more context tokens or concurrent requests.
+KVPP (KV pipeline parallelism) distributes historical KV caches that would otherwise be replicated across TP ranks by layer for MLA/SFA models, including hybrid layouts whose layers own several caches (for example DeepSeek-V4 sliding-window, compressed and indexer caches). This reduces persistent cache storage per rank, allowing the same HBM capacity to accommodate more context tokens or concurrent requests.
 
 When a layer executes, the rank responsible for its cache broadcasts the complete cache to the other ranks in the group. Model computation retains its TP/EP/PP configuration. With PP enabled, each stage assigns caches and broadcasts within its own cache-replica group. The group spans TP ranks, or PCP × TP ranks when PCP is enabled on Model Runner V2, and never crosses DP replicas or PP stages.
 
@@ -72,7 +72,8 @@ KVPP broadcasts each full layer once. No broadcast granularity or separate KVPP 
 
 | Area | Scope |
 | --- | --- |
-| Models and runners | Non-hybrid MLA/SFA models; Model Runner V1 and V2 |
+| Models and runners | MLA/SFA models with single- or multi-group KV cache layouts; Model Runner V1 and V2 |
+| KV cache layout | Every layer bundle is broadcast whole, so layouts may mix block sizes and cache specs. Request-owned ring state (for example the GLM-5-Next indexer tail) is not shardable and is rejected; MTP caches stay replicated |
 | Parallelism and scheduling | TP, EP, PP, chunked prefill, prefix caching, asynchronous scheduling |
 | KV cache layouts | Allocated from actual specifications, including LI-C8 and SFA-C8 |
 | Speculative decoding | Fixed-step MTP; variable-step MTP and other speculative decoding methods are not supported |
