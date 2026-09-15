@@ -24,6 +24,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
     get_layerwise_protocol,
@@ -227,6 +228,8 @@ class KVPoolScheduler:
             self.put_step = self.tp_size // self.num_kv_head
         else:
             self.put_step = 1
+        # KVPP shards layers across ranks: every rank saves its own object.
+        self.use_kvpp = KVPPConfig.from_vllm_config(vllm_config).size > 1
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.layerwise_offload = False
         if self.use_layerwise_transfer:
@@ -526,7 +529,7 @@ class KVPoolScheduler:
         )
         if not block_hashes:
             return 0
-        head_or_tp_ranks = self.tp_size // self.put_step
+        head_or_tp_ranks = self.tp_size if self.use_kvpp else self.tp_size // self.put_step
         keys_by_block = [
             [
                 make_layerwise_block_key(

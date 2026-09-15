@@ -421,6 +421,11 @@ class KVPoolWorker:
         # same physical layer are treated as entries of one layer.
         self.physical_layer_to_group_layers: dict[int, list[tuple[int, int]]] = {}
         self._global_to_local_layer: dict[int, int] = {}
+        # Registered layers of this rank per group, in the same order as
+        # group_layer_cache_entry_offsets. KVPP shards layers across ranks, so
+        # a rank only holds a subset of the model's layers.
+        self.group_layer_local_index: dict[int, dict[int, int]] = {}
+        self.local_physical_layers: set[int] = set()
         self._layerwise_reuse_layout: LayerwiseReuseLayout | None = None
         # Defaults for partial initialization (unit tests construct the worker
         # without the full _init_parallelism_info path).
@@ -885,6 +890,14 @@ class KVPoolWorker:
         self.group_block_stride[group_id] = group_block_strides
         self.group_layer_cache_entry_offsets[group_id] = layer_cache_entry_offsets
         self.group_num_layers[group_id] = len(layer_names_by_physical)
+        self.group_layer_local_index[group_id] = {
+            physical_layer: index for index, physical_layer in enumerate(sorted(layer_names_by_physical))
+        }
+        self.local_physical_layers = {
+            physical_layer
+            for local_index in self.group_layer_local_index.values()
+            for physical_layer in local_index
+        }
 
     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
         """
@@ -2279,8 +2292,7 @@ class KVPoolWorker:
             request.store_masks = self._compute_reachable_store_masks(request)
         for local_layer in range(num_local):
             physical_layer = local_layer + layer_offset
-            group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, local_layer)])
-            for group_id, layer_idx_in_group in group_layers:
+            for group_id, layer_idx_in_group in self._local_group_layers(local_layer, physical_layer):
                 self._process_save_for_layer_batch(requests, local_layer, group_id, layer_idx_in_group)
         # Protect the previous partial before allocating the next snapshot.
         self._prepare_load_gvas(requests)
@@ -2288,10 +2300,28 @@ class KVPoolWorker:
         self._build_shared_save_data()
         for local_layer in range(num_local):
             physical_layer = local_layer + layer_offset
-            group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, local_layer)])
-            for group_id, layer_idx_in_group in group_layers:
+            for group_id, layer_idx_in_group in self._local_group_layers(local_layer, physical_layer):
                 self._process_load_for_layer_batch(requests, local_layer, group_id, layer_idx_in_group)
         self._build_shared_load_data()
+
+    def _local_group_layers(self, local_layer: int, physical_layer: int) -> list[tuple[int, int]]:
+        """Group entries of a layer this rank actually stores.
+
+        KVPP shards the model's layers across ranks, so most physical layers
+        have no cache here: their entries do not exist in the group's stored
+        layout and they must be skipped rather than indexed by layer id. The
+        returned index addresses the entries that were registered for the
+        layer, which is what the block object's byte ranges are built from.
+        """
+        if not getattr(self, "use_kvpp", False):
+            return self.physical_layer_to_group_layers.get(physical_layer, [(0, local_layer)])
+        if self.local_physical_layers and local_layer not in self.local_physical_layers:
+            return []
+        group_layers = self.physical_layer_to_group_layers.get(local_layer, [(0, local_layer)])
+        return [
+            (group_id, self.group_layer_local_index.get(group_id, {}).get(local_layer, layer_idx_in_group))
+            for group_id, layer_idx_in_group in group_layers
+        ]
 
     def _submit_ready_layer_loads(self) -> None:
         assert self.kv_recv_thread is not None

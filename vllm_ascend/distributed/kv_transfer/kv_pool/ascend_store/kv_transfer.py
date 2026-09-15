@@ -502,8 +502,10 @@ class LayerBatchBuilder:
         shared = self.build_shared(task, is_save)
         if shared is None:
             return None
-        layer_index = task.layer_id if task.use_key_major_ranges else task.layer_idx_in_group
-        return self.build_addrs(shared, layer_index)
+        # The task carries the position of the layer inside this rank's stored
+        # entries; a KVPP-sharded rank owns non-contiguous layers, so the
+        # rank-global layer id cannot address the block object's entries.
+        return self.build_addrs(shared, task.layer_idx_in_group)
 
 
 class KVTransferThread(threading.Thread):
