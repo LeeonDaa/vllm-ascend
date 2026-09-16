@@ -48,7 +48,8 @@ class KVPPRuntime:
             if name not in plan.layer_owner_ranks:
                 continue
             _, size = build_kvpp_layer_layout(bundle, plan.tensor_sizes, kv_cache_config.num_blocks)
-            first = kv_caches[name][0]
+            cache = kv_caches[name]
+            first = cache if isinstance(cache, torch.Tensor) else cache[0]
             storage = first.untyped_storage()
             base = first.storage_offset() * first.element_size()
             # The allocator binds every component to this contiguous layer span.

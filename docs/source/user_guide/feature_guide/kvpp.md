@@ -2,7 +2,7 @@
 
 ## Overview
 
-KVPP (KV pipeline parallelism) distributes historical KV caches that would otherwise be replicated across TP ranks by layer for non-hybrid MLA/SFA models. This reduces persistent cache storage per rank, allowing the same HBM capacity to accommodate more context tokens or concurrent requests.
+KVPP (KV pipeline parallelism) distributes historical KV caches that would otherwise be replicated across TP ranks by layer for MLA/SFA models, including hybrid layouts whose layers own several caches (for example DeepSeek-V4 sliding-window, compressed and indexer caches). This reduces persistent cache storage per rank, allowing the same HBM capacity to accommodate more context tokens or concurrent requests.
 
 When a layer executes, the rank responsible for its cache broadcasts the complete cache to the other ranks in the group. Model computation retains its TP/EP/PP configuration. With PP enabled, each stage assigns caches and broadcasts within its own cache-replica group. The group spans TP ranks, or PCP × TP ranks when PCP is enabled on Model Runner V2, and never crosses DP replicas or PP stages.
 
@@ -72,13 +72,14 @@ KVPP broadcasts each full layer once. No broadcast granularity or separate KVPP 
 
 | Area | Scope |
 | --- | --- |
-| Models and runners | Non-hybrid MLA/SFA models; Model Runner V1 and V2 |
+| Models and runners | MLA/SFA models with single- or multi-group KV cache layouts; Model Runner V1 and V2 |
+| KV cache layout | Every layer bundle is broadcast whole, so layouts may mix block sizes and cache specs. Request-owned ring state (for example the GLM-5-Next indexer tail) is not shardable and is rejected; MTP caches stay replicated |
 | Parallelism and scheduling | TP, EP, PP, chunked prefill, prefix caching, asynchronous scheduling |
 | KV cache layouts | Allocated from actual specifications, including LI-C8 and SFA-C8 |
 | Speculative decoding | Fixed-step MTP; variable-step MTP and other speculative decoding methods are not supported |
 | Execution mode | Eager mode only; graph execution is not supported |
 | Context parallelism | PCP requires Model Runner V2; DCP is not supported |
-| KV pooling | Memcache with `AscendStoreConnector`, `kv_producer`, asynchronous whole-block loading; PCP disabled |
+| KV pooling | Memcache with `AscendStoreConnector` and `kv_producer`/asynchronous whole-block loading, plus Mooncake layerwise pooling (`use_layerwise=true`); PCP disabled |
 | PD disaggregation | `MooncakeConnectorV2`; enable KVPP on the prefill node only; PCP disabled |
 
 Feature combinations must also meet the requirements of the model and the individual features.
@@ -105,9 +106,11 @@ Configure the memcache SDK and MetaService as described in [KV Pool](kv_pool.md)
 --kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_producer","kv_connector_extra_config":{"lookup_rpc_port":"0","backend":"memcache","use_layerwise":false,"load_async":true}}'
 ```
 
-This role both saves and loads pooled prefixes. Keep `discard_partial_chunks=true` (the default). Layerwise pooling, KV events, `kv_consumer`, `kv_both`, and consumer write-back are not supported with KVPP.
+This role both saves and loads pooled prefixes. Keep `discard_partial_chunks=true` (the default). KV events, `kv_consumer`, `kv_both`, and consumer write-back are not supported with KVPP.
 
 Each TP rank saves one complete object per token block containing its persistent target layers and its own MTP caches. Scratch buffers are excluded. Loading restores those same persistent buffers; the existing KVPP broadcast supplies other ranks when a layer executes. Pool lookup requires every nonempty owner shard across all PP stages.
+
+The Mooncake layerwise backend follows the same owner-per-rank contract: the objects published by a rank hold that rank's layer shard, addressed by the rank's own registered layer layout, and a prefix counts as a pool hit only when every owner shard has committed it. Run the same KVPP group size and layer layout on producer and consumer, as with whole-block pooling. Hybrid (multi-group) layerwise layouts are supported; see the [Mooncake layerwise hybrid attention guide](mooncake_hybrid_attention.md).
 
 ## Performance
 

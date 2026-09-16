@@ -7,6 +7,7 @@ from vllm_ascend.core.kv_cache_placement import (
     KVPP_SCRATCH_BUFFER_COUNT,
     build_kvpp_layer_layout,
     create_kvpp_cache_allocation_plan,
+    is_flat_cache_spec,
 )
 from vllm_ascend.distributed.parallel_state import get_kvpp_group
 
@@ -29,7 +30,7 @@ def get_kvpp_cache_specs(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpe
 
 def allocate_kvpp_cache(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, device: torch.device
-) -> dict[str, tuple[torch.Tensor, ...]]:
+) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
     """Allocate contiguous layer bundles and two shared Target scratch buffers."""
     plan = create_kvpp_cache_allocation_plan(
         vllm_config, get_kvpp_cache_specs(kv_cache_config), get_kvpp_group().rank_in_group
@@ -42,7 +43,7 @@ def allocate_kvpp_cache(
     scratch = (
         [_allocate_kvpp_buffer(scratch_size, device) for _ in range(KVPP_SCRATCH_BUFFER_COUNT)] if scratch_size else []
     )
-    caches: dict[str, tuple[torch.Tensor, ...]] = {}
+    caches: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
     target_index = 0
     for name, (layout, size) in layouts.items():
         owner = plan.layer_owner_ranks.get(name)
@@ -51,7 +52,13 @@ def allocate_kvpp_cache(
         else:
             buffer = scratch[target_index % KVPP_SCRATCH_BUFFER_COUNT]
         for cache_name, parts in layout.items():
-            caches[cache_name] = tuple(buffer.narrow(0, offset, length) for offset, length in parts)
+            tensors = tuple(buffer.narrow(0, offset, length) for offset, length in parts)
+            # DeepSeek-V4 views one flat page per cache name; every other layout
+            # keeps the per-component tuple the runner expects.
+            if len(tensors) == 1 and is_flat_cache_spec(vllm_config, plan.logical_cache_spec[cache_name]):
+                caches[cache_name] = tensors[0]
+            else:
+                caches[cache_name] = tensors
         if owner is not None:
             target_index += 1
     return caches
