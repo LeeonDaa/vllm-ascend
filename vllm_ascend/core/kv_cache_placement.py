@@ -10,6 +10,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.ascend_config import KVPPConfig
@@ -50,6 +51,38 @@ class KVPPPhysicalCachePlan:
                 scratch_bytes = max(scratch_bytes, size)
         bytes_per_block = persistent_bytes + KVPP_SCRATCH_BUFFER_COUNT * scratch_bytes
         return available_bytes // bytes_per_block if bytes_per_block else 0
+
+
+def kvpp_memory_budget(vllm_config: VllmConfig, plan: KVPPPhysicalCachePlan, available_bytes: int) -> int:
+    """Bytes to advertise as the KV cache budget for one KVPP rank.
+
+    The engine turns the advertised value back into blocks with its own
+    divisor, so it must be expressed in that unit; engine_bytes_per_block
+    returns that divisor.
+    """
+    num_blocks = plan.get_num_blocks(available_bytes)
+    bytes_per_block = engine_bytes_per_block(vllm_config, plan.logical_cache_spec)
+    if bytes_per_block <= 0:
+        return available_bytes
+    return num_blocks * bytes_per_block
+
+
+def engine_bytes_per_block(vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]) -> int:
+    """Bytes per block the engine divides the advertised KV cache budget by.
+
+    KVPP advertises its budget as a byte value derived from block counts, and
+    the engine converts it back with its own divisor. Both sides must use the
+    same unit: advertising ``num_blocks * sum(all page sizes)`` inflates the
+    block count by ``sum(all pages) / engine divisor`` whenever a layout keeps
+    several cache groups per layer, and the per-layer bundles then overflow
+    device memory.
+    """
+    from vllm_ascend.patch.platform.patch_kv_cache_utils import _ascend_pool_bytes_per_block
+
+    kv_cache_groups = get_kv_cache_groups(vllm_config, kv_cache_spec)
+    if not kv_cache_groups:
+        return 0
+    return _ascend_pool_bytes_per_block(kv_cache_groups)
 
 
 def build_layer_cache_bundles(cache_spec: dict[str, KVCacheSpec]) -> dict[str, tuple[str, ...]]:

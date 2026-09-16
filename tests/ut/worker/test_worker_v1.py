@@ -2223,9 +2223,16 @@ class TestKVPPWorkerBudget(TestBase):
         plan = worker._kvpp_cache_allocation_plan
         assert plan is not None
         self.assertEqual(plan.logical_cache_spec, specs)
-        for available, expected in ((1175, 952), (1176, 1428)):
+        # KVPP advertises its budget in the engine's bytes-per-block unit. This
+        # fixture is single-group, so that unit is the sum of its page sizes.
+        bytes_per_block = sum(spec.page_size_bytes for spec in specs.values())
+        for available, blocks in ((1175, 2), (1176, 3)):
             with self.subTest(available=available):
-                self.assertEqual(worker._apply_kvpp_memory_budget(available), expected)
+                with patch(
+                    "vllm_ascend.core.kv_cache_placement.engine_bytes_per_block",
+                    return_value=bytes_per_block,
+                ):
+                    self.assertEqual(worker._apply_kvpp_memory_budget(available), blocks * bytes_per_block)
                 self.assertEqual(worker.available_kv_cache_memory_bytes, available)
         worker._kvpp_cache_allocation_plan = None
         self.assertEqual(worker._apply_kvpp_memory_budget(1176), 1176)
