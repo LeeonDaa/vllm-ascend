@@ -73,6 +73,7 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.core.kv_cache_placement import (
     KVPPPhysicalCachePlan,
     create_kvpp_cache_allocation_plan,
+    kvpp_memory_budget,
 )
 from vllm_ascend.core.profiling_chunk_predictor import (
     _attach_profiling_chunk_execution_time,
@@ -555,8 +556,7 @@ class NPUWorker(WorkerBase):
         plan = self._kvpp_cache_allocation_plan
         if plan is None:
             return available_bytes
-        num_blocks = plan.get_num_blocks(available_bytes)
-        return num_blocks * sum(spec.page_size_bytes for spec in plan.logical_cache_spec.values())
+        return kvpp_memory_budget(self.vllm_config, plan, available_bytes)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -676,6 +676,11 @@ class NPUWorker(WorkerBase):
         # #51718 multi-group scale is main-only. Also avoids
         # CacheConfig.get_resolved_kv_cache_layout which does not exist on release.
         if vllm_version_is("0.28.0"):
+            return available_memory
+        # KVPP already advertises its budget in the engine's own unit (see
+        # _apply_kvpp_memory_budget), so scaling it here would compound and
+        # shrink the planned block count below what the rank can afford.
+        if getattr(self, "_kvpp_cache_allocation_plan", None) is not None:
             return available_memory
         kv_cache_spec = self.get_kv_cache_spec()
         if not isinstance(kv_cache_spec, dict):
