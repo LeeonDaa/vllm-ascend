@@ -298,7 +298,9 @@ def _mock_ascend_store_deps(request):
     # get/reset_attention_compute_start_gate, ...) which _mock_deps.py no longer
     # mocks globally (mutating the real modules leaked into other UTs). Mock them
     # per-test, scoped to the ascend_store tests only.
-    if "distributed/ascend_store/" not in request.node.nodeid:
+    # test_mooncake_hybrid.py drives the real attention fence: its save commits
+    # depend on the gate callbacks firing inside the attention window.
+    if "distributed/ascend_store/" not in request.node.nodeid or "test_mooncake_hybrid" in request.node.nodeid:
         yield
         return
     from unittest.mock import patch
