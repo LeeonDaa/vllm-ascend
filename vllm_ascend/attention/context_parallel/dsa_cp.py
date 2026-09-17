@@ -1370,6 +1370,9 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         self.tp_group = get_tp_group()
         self.tp_size = self.tp_group.world_size
         self.tp_rank = self.tp_group.rank_in_group
+        # Optional platform service injected by the model runner. Attention
+        # stays independent of KVPP scheduling and the concrete transport.
+        self.layerwise_kv_cache_hook: Any = None
 
         # MLA Args
         self.wq_a = kwargs["wq_a"]
@@ -1631,6 +1634,10 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
         if common_attn_metadata is None:
             common_attn_metadata = layer_metadata.swa
         wait_for_kv_layer_from_connector(layer_name)
+        if self.layerwise_kv_cache_hook is not None:
+            # Wait for this layer's full-layer KV cache broadcast before the
+            # local caches are read or overwritten below.
+            self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
         is_decode = common_attn_metadata.attn_state in {
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
