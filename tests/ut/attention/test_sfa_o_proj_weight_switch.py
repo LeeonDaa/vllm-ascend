@@ -242,7 +242,7 @@ class TestAscendSFAOProjWeightSwitch(TestBase):
 
         with (
             patch("vllm_ascend.attention.sfa_v1.wait_for_kv_layer_from_connector"),
-            patch("vllm_ascend.attention.sfa_v1.record_attention_compute_start") as record_gate,
+            patch("vllm_ascend.attention.sfa_v1.attention_transfer_window") as record_gate,
             patch("vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector") as save_layer,
             patch("vllm_ascend.attention.sfa_v1.notify_kv_cache_written") as notify_cache_written,
         ):
