@@ -59,7 +59,15 @@ def test_runtime_binds_complete_layer_storage(monkeypatch, scheduler_device, exp
         backing[34:38].view(torch.float16),
     )
     caches = {main: components[:2], indexer: components[2:], mtp: (torch.zeros(8, dtype=torch.int8),)}
-    context = {name: SimpleNamespace(kv_cache=value, impl=SimpleNamespace()) for name, value in caches.items()}
+    # Only attention impls declare the hook; a module that merely holds a cache
+    # must not be mistaken for one.
+    context = {
+        name: SimpleNamespace(
+            kv_cache=value,
+            impl=SimpleNamespace(layerwise_kv_cache_hook=None) if name == main else SimpleNamespace(),
+        )
+        for name, value in caches.items()
+    }
     runtime = kvpp.KVPPRuntime.create_from_kv_cache(
         vllm_config=make_kvpp_config(2),
         kv_cache_config=make_cache_config(specs, 2),
@@ -122,3 +130,29 @@ def test_hook_propagates_failed_future_without_scheduling_next(scheduler_device)
         scheduler.wait_for_layer(layer_name(0))
     assert raised.value is error
     assert len(scheduler._prefetch_executor.submitted) == 1
+
+
+def test_hook_binds_by_layer_not_by_cache_name():
+    """DeepSeek-V4 holds its state/SWA caches in modules without an impl.
+
+    The bundle key is a cache name, so binding the hook by name raised
+    ``AttributeError: 'AscendDeepseekV4SWACache' object has no attribute
+    'impl'``. The hook belongs to the attention impl of the same layer.
+    """
+    attn_impl = SimpleNamespace(layerwise_kv_cache_hook=None)
+    context = {
+        "model.layers.11.self_attn.state": SimpleNamespace(kv_cache=object()),
+        "model.layers.11.self_attn": SimpleNamespace(impl=attn_impl),
+    }
+
+    assert kvpp._hook_consumers(context, 11) == [attn_impl]
+
+
+def test_hook_requires_exactly_one_impl_per_layer():
+    first = SimpleNamespace(impl=SimpleNamespace(layerwise_kv_cache_hook=None))
+    second = SimpleNamespace(impl=SimpleNamespace(layerwise_kv_cache_hook=None))
+
+    with pytest.raises(ValueError, match="exactly one"):
+        kvpp._hook_consumers({"model.layers.11.self_attn": first, "model.layers.11.indexer": second}, 11)
+    with pytest.raises(ValueError, match="exactly one"):
+        kvpp._hook_consumers({}, 11)
