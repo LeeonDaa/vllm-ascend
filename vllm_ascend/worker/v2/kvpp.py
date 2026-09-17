@@ -5,12 +5,40 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import torch
+from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core.kv_cache_placement import build_kvpp_layer_layout, create_kvpp_cache_allocation_plan
 from vllm_ascend.distributed.kvpp import BroadcastKVPPTransport
 from vllm_ascend.distributed.parallel_state import get_kvpp_group
 from vllm_ascend.worker.kvpp_cache import get_kvpp_cache_specs
+
+
+def _hook_consumers(static_forward_context: dict[str, Any], layer_index: int) -> list[Any]:
+    """Attention impls that consume the KVPP hook for one physical layer.
+
+    A cache name is not an attention module name once a layer registers several
+    caches under their own modules: DeepSeek-V4 keeps its SWA and state caches
+    in dedicated modules without an attention impl, while the layer's attention
+    impl is registered under a different name. Bind by layer index so every
+    sharded layer is hooked exactly once, in layer execution order.
+    """
+    consumers = []
+    for name, module in static_forward_context.items():
+        impl = getattr(module, "impl", None)
+        if not hasattr(impl, "layerwise_kv_cache_hook"):
+            continue
+        try:
+            index = extract_layer_index(name)
+        except ValueError:
+            continue
+        if index == layer_index:
+            consumers.append(impl)
+    if len(consumers) != 1:
+        raise ValueError(
+            f"KVPP needs exactly one hook-consuming attention impl for layer {layer_index}, found {len(consumers)}"
+        )
+    return consumers
 
 
 class KVPPRuntime:
@@ -60,7 +88,8 @@ class KVPPRuntime:
             attention_layer_names=tuple(layer_buffers),
         )
         for name in layer_buffers:
-            static_forward_context[name].impl.layerwise_kv_cache_hook = scheduler
+            for impl in _hook_consumers(static_forward_context, extract_layer_index(name)):
+                impl.layerwise_kv_cache_hook = scheduler
         return cls(scheduler)
 
     def prepare_forward(self, has_history: bool) -> None:
