@@ -5,6 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import KVPPConfig
@@ -13,15 +14,21 @@ from vllm_ascend.distributed.kvpp import BroadcastKVPPTransport
 from vllm_ascend.distributed.parallel_state import get_kvpp_group
 from vllm_ascend.worker.kvpp_cache import get_kvpp_cache_specs
 
+logger = init_logger(__name__)
 
-def _hook_consumers(static_forward_context: dict[str, Any], layer_index: int) -> list[Any]:
+
+def _hook_consumers(static_forward_context: dict[str, Any], layer_index: int) -> list[tuple[str, Any]]:
     """Attention impls that consume the KVPP hook for one physical layer.
 
     A cache name is not an attention module name once a layer registers several
     caches under their own modules: DeepSeek-V4 keeps its SWA and state caches
     in dedicated modules without an attention impl, while the layer's attention
     impl is registered under a different name. Bind by layer index so every
-    sharded layer is hooked exactly once, in layer execution order.
+    sharded layer is hooked, in layer execution order.
+
+    A layer may hold more than one attention impl (DeepSeek-V4 builds one per
+    cache role), and each of them reads the layer's caches, so all of them get
+    the hook; the scheduler advances the pipeline once per layer regardless.
     """
     consumers = []
     for name, module in static_forward_context.items():
@@ -33,11 +40,9 @@ def _hook_consumers(static_forward_context: dict[str, Any], layer_index: int) ->
         except ValueError:
             continue
         if index == layer_index:
-            consumers.append(impl)
-    if len(consumers) != 1:
-        raise ValueError(
-            f"KVPP needs exactly one hook-consuming attention impl for layer {layer_index}, found {len(consumers)}"
-        )
+            consumers.append((name, impl))
+    if not consumers:
+        raise ValueError(f"KVPP found no hook-consuming attention impl for layer {layer_index}")
     return consumers
 
 
@@ -88,7 +93,15 @@ class KVPPRuntime:
             attention_layer_names=tuple(layer_buffers),
         )
         for name in layer_buffers:
-            for impl in _hook_consumers(static_forward_context, extract_layer_index(name)):
+            consumers = _hook_consumers(static_forward_context, extract_layer_index(name))
+            if len(consumers) > 1:
+                logger.info(
+                    "KVPP layer %s binds %d hook consumers: %s",
+                    name,
+                    len(consumers),
+                    [consumer_name for consumer_name, _ in consumers],
+                )
+            for _, impl in consumers:
                 impl.layerwise_kv_cache_hook = scheduler
         return cls(scheduler)
 
@@ -109,6 +122,7 @@ class KVPPScheduler:
         self.attention_layer_names = attention_layer_names
         self._has_history = False
         self._next_attention_layer_index = 0
+        self._last_waited_layer_index: int | None = None
         self._prefetch_future: Future[None] | None = None
         self._npu_device_id = torch.npu.current_device()
         self._kv_transfer_stream = torch.npu.Stream()
@@ -117,6 +131,7 @@ class KVPPScheduler:
     def schedule_forward(self, has_history: bool) -> None:
         self._has_history = has_history
         self._next_attention_layer_index = 0
+        self._last_waited_layer_index = None
         if has_history:
             self.start_layer_prefetch(self.attention_layer_names[0])
 
@@ -132,6 +147,15 @@ class KVPPScheduler:
     def wait_for_layer(self, layer_name: str) -> None:
         if not self._has_history:
             return
+        try:
+            index = extract_layer_index(layer_name)
+        except ValueError:
+            index = None
+        if index is not None and index == self._last_waited_layer_index:
+            # A layer may have several hook consumers; each waits, but the
+            # prefetch pipeline advances once per layer.
+            return
+        self._last_waited_layer_index = index
         assert self._prefetch_future is not None
         self._prefetch_future.result()
         self._prefetch_future = None
@@ -142,3 +166,4 @@ class KVPPScheduler:
     def complete_forward(self) -> None:
         self._has_history = False
         self._next_attention_layer_index = 0
+        self._last_waited_layer_index = None
