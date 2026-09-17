@@ -1501,6 +1501,9 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         **kwargs,
     ):
         self.vllm_config = kwargs["vllm_config"]
+        # Optional platform service injected by the model runner. Attention
+        # stays independent of KVPP scheduling and the concrete transport.
+        self.layerwise_kv_cache_hook: Any = None
         self.num_heads = n_heads
         self.n_local_heads = n_local_heads
         self.scale = scale
@@ -1759,6 +1762,11 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         o_proj_input = hidden_states.new_zeros(o_proj_input_shape)
         assert kv_cache is not None, "kv_cache tensor tuple must be provided."
         wait_for_kv_layer_from_connector(layer_name)
+        if self.layerwise_kv_cache_hook is not None:
+            # The Q/KV projections above overlap the full-layer KV cache
+            # broadcast. Wait for it before this layer's caches are read or
+            # overwritten; the zero-token path below updates them too.
+            self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
         cache_is_prepared = self._prepare_caches_before_attention(
             layer_name,
             hidden_states,
