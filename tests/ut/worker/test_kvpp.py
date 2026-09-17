@@ -145,14 +145,40 @@ def test_hook_binds_by_layer_not_by_cache_name():
         "model.layers.11.self_attn": SimpleNamespace(impl=attn_impl),
     }
 
-    assert kvpp._hook_consumers(context, 11) == [attn_impl]
+    assert kvpp._hook_consumers(context, 11) == [("model.layers.11.self_attn", attn_impl)]
 
 
-def test_hook_requires_exactly_one_impl_per_layer():
+def test_hook_needs_at_least_one_impl_per_layer():
+    with pytest.raises(ValueError, match="no hook-consuming"):
+        kvpp._hook_consumers({}, 11)
+
+
+def test_hook_binds_every_impl_of_a_layer():
+    """A layer builds one attention impl per cache role; all of them read the
+    layer's caches, so all of them wait for the broadcast."""
     first = SimpleNamespace(impl=SimpleNamespace(layerwise_kv_cache_hook=None))
     second = SimpleNamespace(impl=SimpleNamespace(layerwise_kv_cache_hook=None))
+    context = {"model.layers.11.self_attn": first, "model.layers.11.self_attn.c4": second}
 
-    with pytest.raises(ValueError, match="exactly one"):
-        kvpp._hook_consumers({"model.layers.11.self_attn": first, "model.layers.11.indexer": second}, 11)
-    with pytest.raises(ValueError, match="exactly one"):
-        kvpp._hook_consumers({}, 11)
+    assert kvpp._hook_consumers(context, 11) == [
+        ("model.layers.11.self_attn", first.impl),
+        ("model.layers.11.self_attn.c4", second.impl),
+    ]
+
+
+def test_pipeline_advances_once_per_layer_with_several_consumers(scheduler_device):
+    _events, _compute, _transfer = scheduler_device
+    transport = Mock()
+    names = tuple(layer_name(i) for i in range(2))
+    scheduler = kvpp.KVPPScheduler(transport, names)
+    executor = scheduler._prefetch_executor
+
+    scheduler.schedule_forward(True)  # submits the prefetch for layer 0
+    executor.run_next()  # layer 0 broadcast
+    scheduler.wait_for_layer(layer_name(0))  # completes it, submits layer 1
+    executor.run_next()  # layer 1 broadcast
+    scheduler.wait_for_layer(layer_name(0))  # second impl of layer 0: no advance
+
+    assert [call.args[0] for call in transport.prefetch.call_args_list] == [names[0], names[1]]
+    assert not executor.pending
+    scheduler.complete_forward()
