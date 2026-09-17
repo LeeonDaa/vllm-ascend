@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
@@ -80,6 +80,13 @@ def _stub_dsa_c_ascend_ops():
         for name in _DSA_C_ASCEND_OPS:
             stack.enter_context(patch.object(torch.ops._C_ascend, name, create=True, new=MagicMock()))
         yield
+
+
+@contextmanager
+def _record_window(events):
+    """Stand-in for the transfer window: the gate opens when attention starts."""
+    events.append("record")
+    yield
 
 
 def test_build_vision_bidirectional_swa_indices():
@@ -1309,8 +1316,8 @@ def test_forward_attention_routes_unified_req_metadata(
             side_effect=lambda *_: events.append("wait"),
         ),
         patch(
-            "vllm_ascend.attention.dsa_v1.record_attention_compute_start",
-            side_effect=lambda: events.append("record"),
+            "vllm_ascend.attention.dsa_v1.attention_transfer_window",
+            lambda: _record_window(events),
         ),
     ):
         layer_metadata = impl._get_layer_metadata(
@@ -1585,7 +1592,7 @@ def test_forward_attention_sets_compressed_kv_args(
         ) as update_compressed_caches,
         patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan),
         patch("vllm_ascend.attention.dsa_v1.notify_kv_cache_written"),
-        patch("vllm_ascend.attention.dsa_v1.record_attention_compute_start"),
+        patch("vllm_ascend.attention.dsa_v1.attention_transfer_window", MagicMock()),
     ):
         actual = impl._forward_attention(
             "layer",
