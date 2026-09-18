@@ -1290,6 +1290,8 @@ def test_forward_attention_routes_unified_req_metadata(
     )
     plan.add_dsa_sparse_attn_extra_kwargs.side_effect = add_extra_kwargs
 
+    transfer_window = MagicMock()
+    transfer_window.return_value.__enter__.side_effect = lambda: events.append("record")
     with (
         patch.object(
             DeviceOperator,
@@ -1314,10 +1316,7 @@ def test_forward_attention_routes_unified_req_metadata(
             "vllm_ascend.attention.dsa_v1.wait_for_device_metadata",
             side_effect=lambda *_: events.append("wait"),
         ),
-        patch(
-            "vllm_ascend.attention.dsa_v1.record_attention_compute_start",
-            side_effect=lambda: events.append("record"),
-        ),
+        patch("vllm_ascend.attention.dsa_v1.attention_transfer_window", transfer_window),
     ):
         layer_metadata = impl._get_layer_metadata(
             "layer",
@@ -1591,7 +1590,7 @@ def test_forward_attention_sets_compressed_kv_args(
         ) as update_compressed_caches,
         patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan),
         patch("vllm_ascend.attention.dsa_v1.notify_kv_cache_written"),
-        patch("vllm_ascend.attention.dsa_v1.record_attention_compute_start"),
+        patch("vllm_ascend.attention.dsa_v1.attention_transfer_window"),
     ):
         actual = impl._forward_attention(
             "layer",
