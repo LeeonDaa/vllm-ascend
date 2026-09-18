@@ -1225,6 +1225,9 @@ class LayerTransferTask:
     cached_process_tokens: dict[int, list[tuple[int, int, list]]] | None = None
     # Block-key backends use one remote object per block/rank with per-layer ranges.
     use_key_major_ranges: bool = False
+    # KVPP shards layers across ranks, so layer_idx_in_group addresses the
+    # entries this rank registered instead of the rank-global layer id.
+    layer_idx_is_local: bool = False
     # Group-local completion differs from the physical model layer boundary.
     final_group_layer: bool = False
 

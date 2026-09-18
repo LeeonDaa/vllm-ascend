@@ -633,9 +633,14 @@ def _allocate_kv_cache(
         caches = allocate_kvpp_cache(vllm_config, kv_cache_config, device)
         specs = _get_layer_kv_cache_specs(kv_cache_config)
         # Indexer reshape expects a tuple even without a quantization scale.
-        # Single-component main MLA caches still use a raw Tensor.
+        # Single-component main MLA caches still use a raw Tensor, and
+        # DeepSeek-V4 pages are already handed over flat.
         return {
-            name: parts if isinstance(specs[name], AscendSFAIndexerCacheSpec) or len(parts) > 1 else parts[0]
+            name: parts
+            if isinstance(parts, torch.Tensor)
+            or isinstance(specs[name], AscendSFAIndexerCacheSpec)
+            or len(parts) > 1
+            else parts[0]
             for name, parts in caches.items()
         }
     is_dsv4_model = _is_dsv4_model(vllm_config)

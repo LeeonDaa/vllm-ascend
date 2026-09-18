@@ -4,17 +4,25 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.ascend_config import KVPPConfig
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendIndexerKPoolTailSpec,
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
+    AscendSlidingWindowMLASpec,
+)
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor, enable_sfa
+
+logger = init_logger(__name__)
 
 # One buffer for the current layer and one for the next layer's prefetch.
 KVPP_SCRATCH_BUFFER_COUNT = 2
@@ -78,8 +86,15 @@ def build_kvpp_buffer_sizes(
                 sizes.append(elements * spec.scale_dim * get_dtype_size(spec.scale_dtype))
         elif isinstance(spec, AscendMLAAttentionSpec) and spec.cache_sparse_sfa_c8:
             sizes.append(spec.page_size_bytes)
+        elif is_flat_cache_spec(vllm_config, spec):
+            # Block-strided pages are consumed whole: the runner carves the
+            # latent/rope, scale and full or sliding-window views out of one
+            # contiguous page, so the page is the single KVPP component.
+            sizes.append(spec.page_size_bytes)
         else:
             dims = list(get_kvpp_attention_kv_dims(vllm_config, name, spec))
+            if any(dim <= 0 for dim in dims):
+                raise ValueError(f"KVPP cannot size cache {name} ({type(spec).__name__}): dims={dims}")
             if not enable_sfa(vllm_config) and enable_fa_quant(vllm_config):
                 factors = vllm_config.quant_config.get_kv_quant_split_factor(name, dims)
             else:
@@ -87,6 +102,22 @@ def build_kvpp_buffer_sizes(
             sizes.extend(int(spec.page_size_bytes // factor) for factor in factors)
         result[name] = tuple(sizes)
     return result
+
+
+def is_flat_cache_spec(vllm_config: VllmConfig, spec: KVCacheSpec) -> bool:
+    """True when the runner consumes one flat page tensor per cache name.
+
+    Mirrors the runner's block-strided cache layout: compressed models, or cache
+    specs that advertise a block stride, are allocated as one page per layer and
+    the latent/rope, scale and full or sliding-window views are carved out of
+    that page. KVPP must hand those pages over flat instead of per component.
+    """
+    if not isinstance(spec, (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)):
+        return False
+    if getattr(spec, "indexes_kv_by_block_stride", False):
+        return True
+    hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+    return hf_config is not None and hasattr(hf_config, "compress_ratios")
 
 
 def build_kvpp_layer_layout(
@@ -166,15 +197,29 @@ def create_kvpp_cache_allocation_plan(
 ) -> KVPPPhysicalCachePlan:
     """Keep upstream's logical group while budgeting actual allocations."""
     logical_spec = dict(worker_spec)
-    if (
-        any(not isinstance(spec, FullAttentionSpec) for spec in logical_spec.values())
-        or len({spec.block_size for spec in logical_spec.values()}) > 1
-    ):
-        raise ValueError("KVPP requires one full-attention cache group with a common block size.")
+    unsupported = sorted(name for name, spec in logical_spec.items() if isinstance(spec, AscendIndexerKPoolTailSpec))
+    if unsupported:
+        # The tail cache is request-owned ring state, not a block cache that can
+        # be replaced by another rank's copy.
+        raise ValueError("KVPP does not support request-owned indexer tail caches: " + ", ".join(unsupported[:3]))
+    tensor_sizes = build_kvpp_buffer_sizes(vllm_config, logical_spec)
+    layer_bundles = build_layer_cache_bundles(logical_spec)
+    layer_owner_ranks = map_kvpp_layers_to_owners(vllm_config, logical_spec)
+    spec_layouts = sorted({(type(spec).__name__, spec.block_size) for spec in logical_spec.values()})
+    replicated_layers = sum(1 for name in layer_bundles if name not in layer_owner_ranks)
+    logger.info(
+        "KVPP cache plan: %d layer bundles (%d sharded names, %d replicated layers), "
+        "cache layouts %s, block sizes %s",
+        len(layer_bundles),
+        len(layer_owner_ranks),
+        replicated_layers,
+        [name for name, _ in spec_layouts],
+        sorted({block_size for _, block_size in spec_layouts}),
+    )
     return KVPPPhysicalCachePlan(
         logical_cache_spec=logical_spec,
-        layer_owner_ranks=map_kvpp_layers_to_owners(vllm_config, logical_spec),
-        layer_bundles=build_layer_cache_bundles(logical_spec),
-        tensor_sizes=build_kvpp_buffer_sizes(vllm_config, logical_spec),
+        layer_owner_ranks=layer_owner_ranks,
+        layer_bundles=layer_bundles,
+        tensor_sizes=tensor_sizes,
         kvpp_rank=kvpp_rank,
     )

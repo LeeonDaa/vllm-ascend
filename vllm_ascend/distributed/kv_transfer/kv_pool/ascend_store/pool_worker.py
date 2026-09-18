@@ -423,6 +423,11 @@ class KVPoolWorker:
         # same physical layer are treated as entries of one layer.
         self.physical_layer_to_group_layers: dict[int, list[tuple[int, int]]] = {}
         self._global_to_local_layer: dict[int, int] = {}
+        # Registered layers of this rank per group, in the same order as
+        # group_layer_cache_entry_offsets. KVPP shards layers across ranks, so
+        # a rank only holds a subset of the model's layers.
+        self.group_layer_local_index: dict[int, dict[int, int]] = {}
+        self.local_physical_layers: set[int] = set()
         self._layerwise_reuse_layout: LayerwiseReuseLayout | None = None
         # Defaults for partial initialization (unit tests construct the worker
         # without the full _init_parallelism_info path).
@@ -653,6 +658,7 @@ class KVPoolWorker:
                     put_started_keys=self._put_started_keys,
                     put_started_keys_lock=self._put_started_keys_lock,
                     session_tracker=self._layerwise_session_tracker if self.use_block_key_layerwise else None,
+                    final_layer_id=self._last_stored_layer_id(),
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -701,6 +707,7 @@ class KVPoolWorker:
                     invalid_block_ids=self._invalid_block_ids,
                     invalid_block_ids_lock=self._invalid_block_ids_lock,
                     load_abort_event=self._layer_load_aborted,
+                    final_layer_id=self._last_stored_layer_id(),
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -889,6 +896,14 @@ class KVPoolWorker:
         self.group_block_stride[group_id] = group_block_strides
         self.group_layer_cache_entry_offsets[group_id] = layer_cache_entry_offsets
         self.group_num_layers[group_id] = len(layer_names_by_physical)
+        self.group_layer_local_index[group_id] = {
+            physical_layer: index for index, physical_layer in enumerate(sorted(layer_names_by_physical))
+        }
+        self.local_physical_layers = {
+            physical_layer
+            for local_index in self.group_layer_local_index.values()
+            for physical_layer in local_index
+        }
 
     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
         """
@@ -1291,6 +1306,7 @@ class KVPoolWorker:
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
                     use_key_major_ranges=self.use_block_key_layerwise,
+                    layer_idx_is_local=getattr(self, "use_kvpp", False),
                     final_group_layer=layer_idx_in_group
                     == getattr(self, "group_num_layers", {}).get(group_id, self.num_layers) - 1,
                 )
@@ -1403,6 +1419,7 @@ class KVPoolWorker:
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
                     use_key_major_ranges=self.use_block_key_layerwise,
+                    layer_idx_is_local=getattr(self, "use_kvpp", False),
                     final_group_layer=layer_idx_in_group
                     == getattr(self, "group_num_layers", {}).get(group_id, self.num_layers) - 1,
                 )
@@ -2345,8 +2362,7 @@ class KVPoolWorker:
                 self._prepare_block_key_layerwise_sessions(requests)
         for local_layer in range(num_local):
             physical_layer = local_layer + layer_offset
-            group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, local_layer)])
-            for group_id, layer_idx_in_group in group_layers:
+            for group_id, layer_idx_in_group in self._local_group_layers(local_layer, physical_layer):
                 self._process_save_for_layer_batch(
                     group_requests.get(group_id, requests), local_layer, group_id, layer_idx_in_group
                 )
@@ -2356,12 +2372,42 @@ class KVPoolWorker:
         self._build_shared_save_data()
         for local_layer in range(num_local):
             physical_layer = local_layer + layer_offset
-            group_layers = self.physical_layer_to_group_layers.get(physical_layer, [(0, local_layer)])
-            for group_id, layer_idx_in_group in group_layers:
+            for group_id, layer_idx_in_group in self._local_group_layers(local_layer, physical_layer):
                 self._process_load_for_layer_batch(
                     group_requests.get(group_id, requests), local_layer, group_id, layer_idx_in_group
                 )
         self._build_shared_load_data()
+
+    def _local_group_layers(self, local_layer: int, physical_layer: int) -> list[tuple[int, int]]:
+        """Group entries of a layer this rank actually stores.
+
+        KVPP shards the model's layers across ranks, so most physical layers
+        have no cache here: their entries do not exist in the group's stored
+        layout and they must be skipped rather than indexed by layer id. The
+        returned index addresses the entries that were registered for the
+        layer, which is what the block object's byte ranges are built from.
+        """
+        if not getattr(self, "use_kvpp", False):
+            return self.physical_layer_to_group_layers.get(physical_layer, [(0, local_layer)])
+        if self.local_physical_layers and local_layer not in self.local_physical_layers:
+            return []
+        group_layers = self.physical_layer_to_group_layers.get(local_layer, [(0, local_layer)])
+        return [
+            (group_id, self.group_layer_local_index.get(group_id, {}).get(local_layer, layer_idx_in_group))
+            for group_id, layer_idx_in_group in group_layers
+        ]
+
+    def _last_stored_layer_id(self) -> int:
+        """Last layer this rank stores.
+
+        Request completion, lease release and session teardown are keyed on the
+        final layer of the rank's own layer stack: KVPP shards layers across
+        ranks, so the model's last layer is not stored here. Without KVPP the
+        rank stores the whole stack and this is the model's last layer.
+        """
+        if getattr(self, "use_kvpp", False) and self.local_physical_layers:
+            return max(self.local_physical_layers)
+        return self.num_layers - 1
 
     def _check_hybrid_load_errors(self) -> None:
         # A hybrid block ID can belong to SWA, compressed KV or compressor
@@ -2517,13 +2563,13 @@ class KVPoolWorker:
                 self._finish_current_layerwise_load_sessions()
             raise
         self.layer_load_finished_events[self.current_layer].clear()
-        if getattr(self, "block_key_hybrid", False) and self.current_layer == self.num_layers - 1:
+        if getattr(self, "block_key_hybrid", False) and self.current_layer == self._last_stored_layer_id():
             # The final model layer can have no reachable load rows. Completion
             # belongs to the whole request, not whichever group happens to end here.
             for req_id in self._current_layerwise_last_chunk_req_ids:
                 self.kv_recv_thread.set_finished_request(req_id)
         if getattr(self, "use_block_key_layerwise", False) and (
-            self._layer_load_aborted.is_set() or self.current_layer == self.num_layers - 1
+            self._layer_load_aborted.is_set() or self.current_layer == self._last_stored_layer_id()
         ):
             self._finish_current_layerwise_load_sessions()
         if hasattr(self, "kv_role") and not is_kv_save_role(self.kv_role, getattr(self, "consumer_is_to_put", False)):

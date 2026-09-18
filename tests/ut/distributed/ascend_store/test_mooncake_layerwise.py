@@ -94,6 +94,55 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
         self.assertEqual(result.all_sizes, [[30]])
         self.assertEqual(result.all_offsets, [[30]])
 
+    def test_key_major_ranges_use_local_layer_index(self):
+        """A KVPP-sharded rank stores only the layers it owns, compactly.
+
+        Layer 12 is this rank's second local layer, so its ranges are the
+        second entry group of the block object rather than an index derived
+        from the rank-global layer id.
+        """
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[])
+        request.save_block_keys = ["key"]
+        task = LayerTransferTask(
+            layer_id=12,
+            layer_idx_in_group=1,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+            layer_idx_is_local=True,
+        )
+        builder = LayerBatchBuilder(make_token_database(), page_size_bytes=60, num_layers=2)
+
+        result = builder.build(task)
+
+        self.assertIsInstance(result, LayerRangeReqMeta)
+        assert isinstance(result, LayerRangeReqMeta)
+        self.assertEqual(result.keys, ["key"])
+        self.assertEqual(result.all_buffers, [[3600]])
+        self.assertEqual(result.all_sizes, [[30]])
+        self.assertEqual(result.all_offsets, [[30]])
+
+    def test_key_major_ranges_keep_layer_id_without_kvpp(self):
+        """Without KVPP the block key is still addressed by the layer id.
+
+        Turning KVPP on shards layers across ranks, but configurations that
+        do not enable it must behave exactly as before.
+        """
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[])
+        request.save_block_keys = ["key"]
+        task = LayerTransferTask(
+            layer_id=1,
+            layer_idx_in_group=0,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+        )
+        builder = LayerBatchBuilder(make_token_database(), page_size_bytes=60, num_layers=2)
+
+        result = builder.build(task)
+
+        assert isinstance(result, LayerRangeReqMeta)
+        # layer_id=1 selects the object's second entry group, as before.
+        self.assertEqual(result.all_buffers, [[3600]])
+
     def test_range_limits_split_rows_and_large_segments(self):
         batches = KVTransferThread._range_transfer_batches(
             ["k0", "k1"],
@@ -110,6 +159,60 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
 
 
 class TestMooncakeLayerSaveSession(unittest.TestCase):
+    def test_kvpp_owned_layers_commit_without_the_last_model_layer(self):
+        """A KVPP rank stores a layer subset, so its object commits once that
+        subset is complete instead of waiting for the model's last layer."""
+        store = MagicMock()
+        store.batch_copy_put.return_value = [30]
+        store.batch_commit.return_value = [0]
+        tracker = LayerwiseSessionTracker()
+        tracker.register_put_keys("r1", [("key", 0)])
+        num_layers = 8
+        builder = LayerBatchBuilder(make_token_database(), page_size_bytes=60, num_layers=2)
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=store,
+            token_database=make_token_database(),
+            block_size=16,
+            tp_rank=3,
+            tp_size=4,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=num_layers,
+            layer_save_finished_events=[threading.Event() for _ in range(num_layers)],
+            sync_save_events=[MagicMock() for _ in range(num_layers)],
+            group_builders=[builder],
+            put_started_keys={"key"},
+            session_tracker=tracker,
+        )
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[], is_last_chunk=True)
+        request.save_block_keys = ["key"]
+
+        # Rank 3 owns layers 0 and 4; neither of them is layer num_layers - 1.
+        for layer_id, layer_idx_in_group in ((0, 0), (4, 1)):
+            task = LayerTransferTask(
+                layer_id=layer_id,
+                layer_idx_in_group=layer_idx_in_group,
+                layer_idx_is_local=True,
+                final_group_layer=layer_idx_in_group == 1,
+                block_ranges=[LayerBlockRange(request, 0, 1)],
+                shared_block_data=builder.build_shared(
+                    LayerTransferTask(
+                        layer_id=layer_id,
+                        block_ranges=[LayerBlockRange(request, 0, 1)],
+                        use_key_major_ranges=True,
+                    )
+                ),
+                use_key_major_ranges=True,
+            )
+            thread.add_stored_request("r1")
+            thread.request_queue.put([task])
+            thread._handle_request([task])
+
+        self.assertEqual(store.batch_copy_put.call_count, 2)
+        store.batch_commit.assert_called_once_with(["key"])
+        self.assertEqual(tracker.prepare_load_entries("r1", []), [("key", 0)])
+
     def test_final_layer_commits_after_all_ranges(self):
         store = MagicMock()
         # Range APIs may return the positive number of bytes moved on success.
