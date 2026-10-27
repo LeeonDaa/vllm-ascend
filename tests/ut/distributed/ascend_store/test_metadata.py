@@ -40,7 +40,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_cache_transfer_granularity,
     infer_dcp_mismatch_info,
     infer_group_block_sizes,
+    is_prompt_complete_save,
+    is_sync_prefill_save_enabled,
     uses_hybrid_kv_cache,
+    validate_prefill_pp_alignment,
 )
 
 
@@ -857,3 +860,56 @@ class TestInferDcpMismatchInfo(unittest.TestCase):
 
     def test_invalid_peer_value_treated_as_local(self):
         self.assertFalse(infer_dcp_mismatch_info("kv_consumer", {"prefill_dcp_size": "bad"}, 2, 1))
+
+
+class TestSyncPrefillSaveHelpers(unittest.TestCase):
+    def _meta(self, **overrides):
+        values = {
+            "req_id": "r1",
+            "token_len_chunk": 64,
+            "can_save": True,
+            "is_last_chunk": True,
+            "num_prompt_tokens": 70,
+            "save_end_token": 64,
+            "target_token_len": 70,
+        }
+        values.update(overrides)
+        return ReqMeta(**values)
+
+    def test_sync_prefill_save_flag_defaults_to_false(self):
+        self.assertFalse(is_sync_prefill_save_enabled({}))
+        self.assertTrue(is_sync_prefill_save_enabled({"sync_prefill_save": True}))
+
+    def test_prompt_complete_save_accepts_unaligned_tail(self):
+        self.assertTrue(is_prompt_complete_save(self._meta()))
+
+    def test_prompt_complete_save_rejects_decode_increment(self):
+        self.assertFalse(is_prompt_complete_save(self._meta(target_token_len=65, save_end_token=64)))
+        self.assertFalse(is_prompt_complete_save(self._meta(target_token_len=70, save_end_token=80)))
+
+    def test_prompt_complete_save_rejects_missing_boundary_or_save(self):
+        self.assertFalse(is_prompt_complete_save(self._meta(is_last_chunk=None)))
+        self.assertFalse(is_prompt_complete_save(self._meta(can_save=False)))
+        self.assertFalse(is_prompt_complete_save(self._meta(num_prompt_tokens=None)))
+        load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=64, can_load=True)
+        self.assertFalse(is_prompt_complete_save(self._meta(load_spec=load_spec)))
+
+
+class TestValidatePrefillPpAlignment(unittest.TestCase):
+    def test_requires_matching_peer_pp_for_load_consumer(self):
+        with self.assertRaisesRegex(ValueError, "pipeline parallel"):
+            validate_prefill_pp_alignment("kv_consumer", {"prefill_pp_size": "2"}, 1, True)
+        self.assertEqual(validate_prefill_pp_alignment("kv_consumer", {"prefill_pp_size": "1"}, 1, True), 1)
+
+    def test_infers_peer_pp_from_layer_partition(self):
+        with self.assertRaisesRegex(ValueError, "pipeline parallel"):
+            validate_prefill_pp_alignment("kv_consumer", {"prefill_pp_layer_partition": "16,16"}, 1, True)
+        self.assertEqual(
+            validate_prefill_pp_alignment("kv_consumer", {"prefill_pp_layer_partition": "16,16"}, 2, True),
+            2,
+        )
+
+    def test_load_disabled_or_missing_peer_keeps_put_path_compatible(self):
+        self.assertIsNone(validate_prefill_pp_alignment("kv_consumer", {"prefill_pp_size": "2"}, 1, False))
+        self.assertIsNone(validate_prefill_pp_alignment("kv_consumer", {}, 1, True))
+        self.assertIsNone(validate_prefill_pp_alignment("kv_producer", {"prefill_pp_size": "2"}, 1, True))

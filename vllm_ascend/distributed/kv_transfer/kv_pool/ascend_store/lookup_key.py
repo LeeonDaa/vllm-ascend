@@ -85,6 +85,12 @@ class LookupKeyClient:
             self.close()
             return 0
 
+        # The reply is either a 4-byte hit count or RESP_ERR. Decoding an error
+        # reply as a hit count reports a bogus prefix that no transfer will
+        # ever satisfy, so the engine waits for it indefinitely.
+        if bytes(resp) == RESP_ERR or len(resp) != 4:
+            logger.error("KV pool lookup RPC returned an invalid reply (%r); reporting 0 hit tokens", bytes(resp))
+            return 0
         return int.from_bytes(resp, "big")
 
     def reset(self) -> bool:

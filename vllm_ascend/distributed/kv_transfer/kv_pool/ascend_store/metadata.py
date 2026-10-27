@@ -24,6 +24,60 @@ def is_kv_save_role(kv_role: str, consumer_is_to_put: bool) -> bool:
     return kv_role in ("kv_producer", "kv_both") or consumer_is_to_put
 
 
+def is_sync_prefill_save_enabled(extra_config: Mapping[str, Any] | object) -> bool:
+    if not isinstance(extra_config, Mapping):
+        return False
+    return bool(extra_config.get("sync_prefill_save", False))
+
+
+def is_prompt_complete_save(meta: Any) -> bool:
+    """Whether this metadata step finished publishing a prompt prefix."""
+    if meta.can_save is not True or meta.is_last_chunk is not True:
+        return False
+    if meta.load_spec is not None or meta.num_prompt_tokens is None:
+        return False
+    return meta.target_token_len <= meta.num_prompt_tokens and meta.save_end_token <= meta.num_prompt_tokens
+
+
+def validate_prefill_pp_alignment(
+    kv_role: str,
+    extra_config: Mapping[str, Any] | object,
+    local_pp_size: int,
+    consumer_is_to_load: bool,
+) -> int | None:
+    """Reject pool loads that only cover one stage of a different PP topology.
+
+    Pool keys are bound to the local PP stage. Cross-PP lookup/load is not
+    implemented, so loading with unequal PP sizes silently returns a partial
+    stage instead of the full prompt. Return the peer PP size when configured
+    so callers can warn when it is absent.
+    """
+    if kv_role != "kv_consumer" or not consumer_is_to_load or not isinstance(extra_config, Mapping):
+        return None
+
+    local_pp_size = _as_positive_int(local_pp_size, 1)
+    peer_pp_size: int | None = None
+    if "prefill_pp_size" in extra_config:
+        peer_pp_size = _as_positive_int(extra_config.get("prefill_pp_size"), local_pp_size)
+    else:
+        partition = extra_config.get("prefill_pp_layer_partition")
+        if partition is not None:
+            parts = [part for part in str(partition).split(",") if part.strip()]
+            if parts:
+                peer_pp_size = len(parts)
+
+    if peer_pp_size is None:
+        return None
+    if peer_pp_size != local_pp_size:
+        raise ValueError(
+            "KV pool load requires matching prefill/decode pipeline parallel "
+            f"sizes (local_pp_size={local_pp_size}, prefill_pp_size={peer_pp_size}). "
+            "Pool keys are bound to local PP stages and cross-PP load is not supported; "
+            "align pipeline_parallel_size or disable consumer_is_to_load."
+        )
+    return peer_pp_size
+
+
 @dataclass(frozen=True)
 class TPMismatchInfo:
     enabled: bool
@@ -1162,6 +1216,22 @@ class ReqMeta:
         if load_spec is not None and load_spec.can_load and not save_partial_block:
             skip_save = True
         if skip_save and load_spec is None:
+            # A skipped save publishes nothing to the pool and previously left
+            # no trace at all. Log the deciding quantities so an empty
+            # block-hash list (e.g. prefix caching disabled) is visible.
+            logger.debug(
+                "KV pool skip save req=%s token_len=%d block_hashes=%d "
+                "available_full_blocks=%d num_tokens_to_save=%d chunk_boundary=%d "
+                "granularity=%d partial_block_index=%s",
+                tracker.req_id,
+                target_token_len,
+                len(block_hashes),
+                available_full_block_count,
+                num_tokens_to_save,
+                chunk_boundary,
+                cache_transfer_granularity,
+                partial_block_index,
+            )
             return None
 
         if not skip_save:

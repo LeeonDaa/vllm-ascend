@@ -265,6 +265,24 @@ class TestAscendStoreConnector(unittest.TestCase):
         mock_lookup_cls.assert_called_once()
         self.assertIs(connector.get_kv_connector_stats(), stats)
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.logger")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.LookupKeyServer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.KVPoolWorker")
+    def test_invalid_sync_prefill_save_warns_once(self, mock_worker_cls, mock_lookup_cls, mock_logger):
+        config = self._make_vllm_config(
+            kv_role="kv_consumer",
+            extra_config={"sync_prefill_save": True},
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        AscendStoreConnector(
+            vllm_config=config,
+            role=KVConnectorRole.WORKER,
+            kv_cache_config=None,
+        )
+
+        mock_logger.warning.assert_called_once()
+
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.KVPoolScheduler")
     def test_scheduler_methods_delegate(self, mock_scheduler_cls):
         config = self._make_vllm_config()
