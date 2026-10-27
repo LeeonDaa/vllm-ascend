@@ -61,7 +61,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_group_block_sizes,
     infer_group_cache_families,
     infer_tp_mismatch_info,
+    is_prompt_complete_save,
+    is_sync_prefill_save_enabled,
     uses_hybrid_kv_cache,
+    validate_prefill_pp_alignment,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
@@ -168,6 +171,10 @@ class KVPoolWorker:
         self._invalid_block_ids_lock = threading.Lock()
         self._retired_store_req_ids: set[str] = set()
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
+        self.consumer_is_to_load = extra_config.get("consumer_is_to_load", False)
+        self.sync_prefill_save = is_sync_prefill_save_enabled(extra_config)
+        self._peer_rank_layout_mismatch = False
+        self._peer_rank_probe_done = False
         self.save_decode_cache = extra_config.get("save_decode_cache", False)
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or self.consumer_is_to_put or self.save_decode_cache
         self.backend = extra_config.get("backend", "mooncake")
@@ -282,7 +289,37 @@ class KVPoolWorker:
             self.effective_heads_per_rank = tp_mismatch_info.effective_heads_per_rank
             self.num_sub_keys = tp_mismatch_info.num_sub_keys
 
+        # A shared pool requires the peer's key layout. The strided TP-mismatch
+        # path above handles supported multi-head layouts; MLA, sparse and
+        # single-head layouts keep one shared key. Anything else would only
+        # query head_or_tp_rank 0 and silently load a partial KV shard.
+        shared_pool = self.sync_prefill_save or self.consumer_is_to_load
+        if (
+            shared_pool
+            and self.peer_tp_size != self.tp_size
+            and not self.tp_mismatch
+            and not (self.use_mla or self.use_sparse or self.num_kv_head == 1)
+        ):
+            raise ValueError(
+                f"TP mismatch (local_tp={self.tp_size}, peer_tp={self.peer_tp_size}) "
+                "is not supported for a shared KV pool with a multi-head KV layout. "
+                "Align tensor_parallel_size, use an MLA/single-head model, or disable "
+                "consumer_is_to_load/sync_prefill_save."
+            )
+
     def _init_metadata(self, model_config, vllm_config, extra_config) -> None:
+        peer_pp_size = validate_prefill_pp_alignment(
+            self.kv_role,
+            extra_config,
+            self.pp_size,
+            self.consumer_is_to_load,
+        )
+        if self.kv_role == "kv_consumer" and self.consumer_is_to_load and peer_pp_size is None:
+            logger.warning(
+                "consumer_is_to_load is enabled without prefill_pp_size or "
+                "prefill_pp_layer_partition; assuming prefill pipeline_parallel_size=%d.",
+                self.pp_size,
+            )
         partitions = None
         if self.kv_role == "kv_consumer" and self.can_put:
             num_hidden_layers = model_config.hf_text_config.num_hidden_layers
@@ -325,6 +362,26 @@ class KVPoolWorker:
         )
         self.cache_coordinator = self._build_cache_coordinator(vllm_config)
         self.token_database.cache_coordinator = self.cache_coordinator
+        logger.info(
+            "KV pool fingerprint: model=%s pp=%d tp=%d dcp=%d pcp=%d "
+            "group_block_sizes=%s cache_families=%s cacheable_group_ids=%s "
+            "hash_block_size=%d cache_transfer_granularity=%d put_step=%d "
+            "head_or_tp_rank=%d use_mla=%s use_hybrid=%s",
+            self.model_name,
+            self.pp_size,
+            self.tp_size,
+            self.dcp_size,
+            self.pcp_size,
+            self.grouped_block_size,
+            self.kv_cache_group_families,
+            self.cacheable_group_ids,
+            self.hash_block_size,
+            self.cache_transfer_granularity,
+            self.put_step,
+            self.head_or_tp_rank,
+            self.use_mla,
+            self.use_hybrid,
+        )
 
     def _init_backend(self, parallel_config, extra_config, memcache_dp_init_barrier: bool = True) -> None:
         backend = backend_map.get(self.backend.lower())
@@ -1095,6 +1152,22 @@ class KVPoolWorker:
             return
 
         self._previous_save_batch = send_thread.add_save_batch(requests)
+        if not self.sync_prefill_save or self.use_layerwise:
+            return
+
+        fenced = {request.req_id: request for request in requests if is_prompt_complete_save(request)}
+        if not fenced:
+            return
+        send_thread.wait_for_requests_saved(set(fenced))
+        send_thread.raise_if_failed()
+        for req_id, request in fenced.items():
+            saved_offset = send_thread.get_saved_offset(req_id)
+            if saved_offset < request.save_end_token:
+                raise RuntimeError(
+                    f"KV pool save fence failed for req_id={req_id} tp_rank={self.tp_rank}: "
+                    f"saved_offset={saved_offset} expected={request.save_end_token}. "
+                    "The prefill response must not be returned before the prompt KV is durable."
+                )
 
     def _make_sub_key_str(self, base_key: str, effective_rank: int) -> str:
         """Rewrite ``@head_or_tp_rank:<local>`` in serialized ``base_key`` to ``<effective_rank>``.
@@ -1550,6 +1623,97 @@ class KVPoolWorker:
             return [key]
         return self._expand_lookup_keys_by_rank([key], group_id)
 
+    def _probe_peer_rank_layout(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        kv_cache_group_ids: list[int],
+    ) -> bool:
+        """Detect a peer layout that shares this pool but writes other ranks.
+
+        Missing peer topology configuration is otherwise indistinguishable
+        from an empty pool. A single probe per worker turns a would-be partial
+        stage load into a safe miss.
+        """
+        if self._peer_rank_probe_done:
+            return self._peer_rank_layout_mismatch
+        if not self.consumer_is_to_load or self.use_layerwise:
+            self._peer_rank_probe_done = True
+            return False
+
+        try:
+            mismatch = self._detect_peer_rank_layout(token_len, block_hashes, kv_cache_group_ids)
+        except Exception as e:  # noqa: BLE001 - a probe must never abort lookup
+            # The lookup RPC encodes failures as RESP_ERR, which the client
+            # decodes as a hit count. Letting this escape would report a bogus
+            # full-prefix hit and hang the decode engine waiting for a transfer.
+            logger.error(
+                "KV pool peer-rank layout probe failed: pp=%d tp=%d dcp=%d type=%s error=%s. "
+                "Disabling the probe for this worker; hits are trusted as before.",
+                self.pp_size,
+                self.tp_size,
+                self.dcp_size,
+                type(e).__name__,
+                e,
+            )
+            mismatch = False
+        self._peer_rank_probe_done = True
+        self._peer_rank_layout_mismatch = mismatch
+        return mismatch
+
+    def _detect_peer_rank_layout(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        kv_cache_group_ids: list[int],
+    ) -> bool:
+        group_id = next(
+            (group for group in kv_cache_group_ids if group in self.cacheable_group_ids),
+            kv_cache_group_ids[0],
+        )
+        keys, _, _ = self._build_lookup_keys(token_len, block_hashes, group_id)
+        if not keys:
+            return False
+        base_key = keys[0]
+        probes: list[str] = []
+        if self.pp_size == 1:
+            probes.extend(self._replace_key_field(base_key, "pp_rank", rank) for rank in range(1, 9))
+        if self.tp_size == 1 and not self.tp_mismatch:
+            probes.extend(self._replace_key_field(base_key, "head_or_tp_rank", rank) for rank in range(1, 9))
+        if self.dcp_size == 1:
+            probes.extend(self._replace_key_field(base_key, "dcp", rank) for rank in range(1, 9))
+        probes = list(dict.fromkeys(probe for probe in probes if probe != base_key))
+        if not probes:
+            return False
+
+        result = self.m_store.exists(probes)
+        if not any(value == 1 for value in result):
+            return False
+        logger.error(
+            "KV pool peer-rank layout mismatch: local pp=%d tp=%d dcp=%d probed peer keys exist "
+            "for the same namespace. Configure matching prefill_pp_size/prefill_tp_size and "
+            "prefill_dcp_size, or use a dedicated tenant/namespace. Returning a safe miss.",
+            self.pp_size,
+            self.tp_size,
+            self.dcp_size,
+        )
+        return True
+
+    def _guard_peer_rank_hit(
+        self,
+        hit: int,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        kv_cache_group_ids: list[int],
+    ) -> int:
+        if hit <= 0 or not self.consumer_is_to_load or self.use_layerwise:
+            return hit
+        if self._peer_rank_layout_mismatch:
+            return 0
+        if self._probe_peer_rank_layout(token_len, block_hashes, kv_cache_group_ids):
+            return 0
+        return hit
+
     def _lookup_with_coordinator(
         self,
         token_len: int,
@@ -1628,6 +1792,8 @@ class KVPoolWorker:
         :param tokens: the input tokens, with shape [seq_len]
         :return: An int indicating how many prefix tokens are cached.
         """
+        if self._peer_rank_layout_mismatch:
+            return 0
         try:
             hits: list[list[int]] = []
             max_hit_position = self.max_model_len
@@ -1644,7 +1810,12 @@ class KVPoolWorker:
                 )
             )
             if coordinator_hit is not None:
-                return coordinator_hit
+                return self._guard_peer_rank_hit(
+                    coordinator_hit,
+                    token_len,
+                    block_hashes,
+                    kv_cache_group_ids,
+                )
             for group_id in kv_cache_group_ids:
                 keys, starts, ends = self._build_lookup_keys(token_len, block_hashes, group_id)
 
@@ -1696,6 +1867,14 @@ class KVPoolWorker:
                     max_hit_position,
                     token_len,
                 )
+            final_hits = self._max_intersection_hit_position(hits)
+            logger.debug(
+                "KV pool scheduler lookup final token_len=%d groups=%s hit=%d",
+                token_len,
+                kv_cache_group_ids,
+                final_hits,
+            )
+            return self._guard_peer_rank_hit(final_hits, token_len, block_hashes, kv_cache_group_ids)
         except Exception as e:
             logger.error(
                 "Remote connection failed in lookup. type=%s, error=%s. Check network and remote store.",
@@ -1703,14 +1882,6 @@ class KVPoolWorker:
                 e,
             )
             return 0
-        final_hits = self._max_intersection_hit_position(hits)
-        logger.debug(
-            "KV pool scheduler lookup final token_len=%d groups=%s hit=%d",
-            token_len,
-            kv_cache_group_ids,
-            final_hits,
-        )
-        return final_hits
 
     @staticmethod
     def _max_intersection_hit_position(hits: list[list[int]]) -> int:

@@ -36,8 +36,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_group_block_sizes,
     infer_group_cache_families,
     infer_tp_mismatch_info,
+    is_sync_prefill_save_enabled,
     normalize_block_ids_by_group,
     uses_hybrid_kv_cache,
+    validate_prefill_pp_alignment,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
@@ -88,6 +90,7 @@ class KVPoolScheduler:
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
         )
+        self.sync_prefill_save = is_sync_prefill_save_enabled(extra_config)
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = bool(kv_event_config and kv_event_config.enable_kv_cache_events)
@@ -169,6 +172,19 @@ class KVPoolScheduler:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = (vllm_config.parallel_config.rank // self.tp_size) % self.pp_size
+        peer_pp_size = validate_prefill_pp_alignment(
+            self.kv_role,
+            extra_config,
+            self.pp_size,
+            self.consumer_is_to_load,
+        )
+        if self.kv_role == "kv_consumer" and self.consumer_is_to_load and peer_pp_size is None:
+            logger.warning(
+                "consumer_is_to_load is enabled without prefill_pp_size or "
+                "prefill_pp_layer_partition; assuming prefill pipeline_parallel_size=%d. "
+                "Set the peer PP size explicitly to catch topology mismatches at startup.",
+                self.pp_size,
+            )
         # Global layer offset for layerwise pool keys under PP (matches the
         # pool worker's pp_layer_offset).
         self.pp_layer_offset = 0
@@ -440,12 +456,19 @@ class KVPoolScheduler:
             return None
         if self.client is None or self.client.closed:
             self.client = LookupKeyClient(self.vllm_config)
-        return self.client.lookup(
+        sync_prefill_lookup = self.sync_prefill_save and self.kv_role != "kv_consumer"
+        lookup_start = 0 if sync_prefill_lookup else num_computed_tokens
+        hit = self.client.lookup(
             token_len,
             request.block_hashes,
             self.kv_cache_group_ids,
-            hbm_hit_tokens=num_computed_tokens,
+            hbm_hit_tokens=lookup_start,
         )
+        if sync_prefill_lookup and hit < token_len:
+            # A partial pool prefix would suppress saving the freshly computed
+            # suffix. Recompute and publish the whole prompt.
+            return 0
+        return hit
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         """

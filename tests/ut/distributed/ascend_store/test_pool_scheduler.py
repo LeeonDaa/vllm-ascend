@@ -415,6 +415,75 @@ class TestKVPoolScheduler(unittest.TestCase):
                 self.assertEqual("r1" in scheduler.load_specs, expected > 0)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_consumer_is_to_load_uses_pool_lookup(self, mock_client_cls):
+        mock_client_cls.return_value.lookup.return_value = 48
+        config = self._make_config(
+            kv_role="kv_consumer", extra_config={"consumer_is_to_load": True, "load_async": False}
+        )
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        request = MagicMock(
+            prompt_token_ids=list(range(64)),
+            num_tokens=64,
+            request_id="decode-r1",
+            block_hashes=[b"h"] * 4,
+        )
+
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 16), (32, False))
+        mock_client_cls.return_value.lookup.assert_called_once_with(
+            64,
+            request.block_hashes,
+            scheduler.kv_cache_group_ids,
+            hbm_hit_tokens=16,
+        )
+        self.assertEqual(scheduler.load_specs["decode-r1"].kvpool_cached_tokens, 48)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_sync_prefill_save_requires_a_complete_pool_prefix(self, mock_client_cls):
+        request = MagicMock(
+            prompt_token_ids=list(range(64)),
+            num_tokens=64,
+            request_id="sync-r1",
+            block_hashes=[b"h"] * 4,
+        )
+        config = self._make_config(extra_config={"sync_prefill_save": True})
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+
+        mock_client_cls.return_value.lookup.return_value = 32
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 16), (0, False))
+        mock_client_cls.return_value.lookup.assert_called_once_with(
+            64,
+            request.block_hashes,
+            scheduler.kv_cache_group_ids,
+            hbm_hit_tokens=0,
+        )
+        self.assertNotIn("sync-r1", scheduler.load_specs)
+
+        mock_client_cls.return_value.lookup.reset_mock()
+        mock_client_cls.return_value.lookup.return_value = 64
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 16), (47, False))
+        mock_client_cls.return_value.lookup.assert_called_once_with(
+            64,
+            request.block_hashes,
+            scheduler.kv_cache_group_ids,
+            hbm_hit_tokens=0,
+        )
+        self.assertEqual(scheduler.load_specs["sync-r1"].kvpool_cached_tokens, 63)
+
+    def test_load_consumer_rejects_unequal_prefill_pp(self):
+        config = self._make_config(
+            kv_role="kv_consumer",
+            extra_config={"consumer_is_to_load": True, "prefill_pp_size": "2"},
+        )
+        with self.assertRaisesRegex(ValueError, "pipeline parallel"):
+            KVPoolScheduler(config, use_layerwise=False)
+
+        config = self._make_config(
+            kv_role="kv_consumer",
+            extra_config={"consumer_is_to_put": True, "prefill_pp_size": "2"},
+        )
+        KVPoolScheduler(config, use_layerwise=False)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_retention_interval_does_not_skip_external_lookup(self, mock_client_cls):
         """A retained checkpoint can be reused before two retention intervals."""
         for use_eagle in (False, True):
