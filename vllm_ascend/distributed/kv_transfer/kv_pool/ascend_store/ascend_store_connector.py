@@ -140,6 +140,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             "save_decode_cache", False
         )
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or self.consumer_is_to_put or self.save_decode_cache
+        self._wait_for_save_seen = False
         if (
             self.kv_role == "kv_consumer"
             and self.save_decode_cache
@@ -450,6 +451,16 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         cast(LayerwiseKVPoolWorker, self.connector_worker).save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):
+        if not self._wait_for_save_seen:
+            # One-shot diagnostic: distinguishes "engine never called the save
+            # hook" from "hook called but no request was savable".
+            self._wait_for_save_seen = True
+            logger.info(
+                "KV pool wait_for_save hook entered: kv_role=%s can_put=%s use_layerwise=%s",
+                self.kv_role,
+                self.can_put,
+                self.use_layerwise,
+            )
         if not self.can_put:
             # A load-only consumer has no store thread to wait for.
             return

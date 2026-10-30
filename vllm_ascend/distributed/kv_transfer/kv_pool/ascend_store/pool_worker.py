@@ -325,6 +325,26 @@ class KVPoolWorker:
         )
         self.cache_coordinator = self._build_cache_coordinator(vllm_config)
         self.token_database.cache_coordinator = self.cache_coordinator
+        logger.info(
+            "KV pool fingerprint: model=%s pp=%d tp=%d dcp=%d pcp=%d "
+            "group_block_sizes=%s cache_families=%s cacheable_group_ids=%s "
+            "hash_block_size=%d cache_transfer_granularity=%d put_step=%d "
+            "head_or_tp_rank=%d use_mla=%s use_hybrid=%s",
+            self.model_name,
+            self.pp_size,
+            self.tp_size,
+            self.dcp_size,
+            self.pcp_size,
+            self.grouped_block_size,
+            self.kv_cache_group_families,
+            self.cacheable_group_ids,
+            self.hash_block_size,
+            self.cache_transfer_granularity,
+            self.put_step,
+            self.head_or_tp_rank,
+            self.use_mla,
+            self.use_hybrid,
+        )
 
     def _init_backend(self, parallel_config, extra_config, memcache_dp_init_barrier: bool = True) -> None:
         backend = backend_map.get(self.backend.lower())
@@ -1091,6 +1111,11 @@ class KVPoolWorker:
             request.current_event = current_event
             requests.append(request)
 
+        logger.debug(
+            "KV pool wait_for_save metadata_requests=%d savable_requests=%d",
+            len(connector_metadata.requests),
+            len(requests),
+        )
         if not requests:
             return
 

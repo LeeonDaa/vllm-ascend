@@ -1162,6 +1162,19 @@ class ReqMeta:
         if load_spec is not None and load_spec.can_load and not save_partial_block:
             skip_save = True
         if skip_save and load_spec is None:
+            logger.debug(
+                "KV pool skip save req=%s token_len=%d block_hashes=%d "
+                "available_full_blocks=%d num_tokens_to_save=%d chunk_boundary=%d "
+                "granularity=%d partial_block_index=%s",
+                tracker.req_id,
+                target_token_len,
+                len(block_hashes),
+                available_full_block_count,
+                num_tokens_to_save,
+                chunk_boundary,
+                cache_transfer_granularity,
+                partial_block_index,
+            )
             return None
 
         if not skip_save:
