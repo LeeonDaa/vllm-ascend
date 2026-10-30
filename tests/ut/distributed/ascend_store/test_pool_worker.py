@@ -20,7 +20,7 @@ import threading
 import unittest
 from itertools import product
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -1473,148 +1473,10 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.kv_send_thread.add_save_batch.assert_not_called()
         worker.kv_send_thread.request_queue.join.assert_not_called()
 
-    def test_sync_prefill_save_fences_prompt_completion(self):
-        worker = self._make_worker(extra_config={"backend": "mooncake", "sync_prefill_save": True})
-        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
-        worker.kv_send_thread.get_saved_offset.return_value = 16
-
-        prompt_done = ReqMeta(
-            req_id="r1",
-            token_len_chunk=16,
-            block_ids=[0],
-            block_hashes=["h0"],
-            can_save=True,
-            is_last_chunk=True,
-            num_prompt_tokens=20,
-            save_end_token=16,
-            target_token_len=20,
-        )
-        mid_chunk = ReqMeta(
-            req_id="r2",
-            token_len_chunk=16,
-            block_ids=[1],
-            block_hashes=["h1"],
-            can_save=True,
-            is_last_chunk=False,
-            num_prompt_tokens=40,
-            save_end_token=16,
-            target_token_len=16,
-        )
-        meta = AscendConnectorMetadata(set(), set())
-        meta.add_request(prompt_done)
-        meta.add_request(mid_chunk)
-
-        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
-        with patch(f"{module}.torch.npu", create=True):
-            worker.wait_for_save(meta)
-
-        worker.kv_send_thread.wait_for_requests_saved.assert_called_once_with({"r1"})
-        worker.kv_send_thread.raise_if_failed.assert_called_once_with()
-
-    def test_sync_prefill_save_rejects_short_durable_offset(self):
-        worker = self._make_worker(extra_config={"backend": "mooncake", "sync_prefill_save": True})
-        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
-        worker.kv_send_thread.get_saved_offset.return_value = 8
-        req = ReqMeta(
-            req_id="r1",
-            token_len_chunk=16,
-            block_ids=[0],
-            block_hashes=["h0"],
-            can_save=True,
-            is_last_chunk=True,
-            num_prompt_tokens=16,
-            save_end_token=16,
-            target_token_len=16,
-        )
-        meta = AscendConnectorMetadata(set(), set())
-        meta.add_request(req)
-
-        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
-        with patch(f"{module}.torch.npu", create=True), self.assertRaisesRegex(RuntimeError, "saved_offset"):
-            worker.wait_for_save(meta)
-
-    def test_sync_prefill_save_disabled_does_not_fence(self):
-        worker = self._make_worker()
-        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
-        req = ReqMeta(
-            req_id="r1",
-            token_len_chunk=16,
-            block_ids=[0],
-            block_hashes=["h0"],
-            can_save=True,
-            is_last_chunk=True,
-            num_prompt_tokens=16,
-            save_end_token=16,
-            target_token_len=16,
-        )
-        meta = AscendConnectorMetadata(set(), set())
-        meta.add_request(req)
-
-        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
-        with patch(f"{module}.torch.npu", create=True):
-            worker.wait_for_save(meta)
-
-        worker.kv_send_thread.wait_for_requests_saved.assert_not_called()
-
-    def test_sync_prefill_save_parses_flags_and_rejects_pp_mismatch(self):
-        worker = self._make_worker(
-            extra_config={"backend": "mooncake", "sync_prefill_save": True, "decode_tp_size": "1"}
-        )
-        self.assertTrue(worker.sync_prefill_save)
-        self.assertEqual(worker.peer_tp_size, 1)
-
-        with self.assertRaisesRegex(ValueError, "pipeline parallel"):
-            self._make_worker(
-                kv_role="kv_consumer",
-                extra_config={"backend": "mooncake", "consumer_is_to_load": True, "prefill_pp_size": "2"},
-            )
-
-    def test_consumer_load_peer_rank_layout_is_safe_miss(self):
-        worker = self._make_worker(
-            kv_role="kv_consumer",
-            extra_config={
-                "backend": "mooncake",
-                "consumer_is_to_load": True,
-                "prefill_pp_size": "1",
-                "prefill_tp_size": "1",
-            },
-        )
-
-        def exists(keys):
-            return [1] * len(keys) if len(keys) == 2 else [0] * len(keys)
-
-        worker.m_store.exists.side_effect = exists
-        self.assertEqual(worker.lookup_scheduler(32, ["h0", "h1"], use_layerwise=False), 32)
-        call_count = worker.m_store.exists.call_count
-        self.assertEqual(worker.lookup_scheduler(32, ["h0", "h1"], use_layerwise=False), 32)
-        self.assertEqual(worker.m_store.exists.call_count, call_count + 1)
-
-        worker.m_store.exists.reset_mock()
-        worker.m_store.exists.side_effect = lambda keys: [1] * len(keys)
-        worker._peer_rank_probe_done = False
-        worker._peer_rank_layout_mismatch = False
-        self.assertEqual(worker.lookup_scheduler(32, ["h0", "h1"], use_layerwise=False), 0)
-        self.assertTrue(worker._peer_rank_layout_mismatch)
-        calls_after_first = worker.m_store.exists.call_count
-        self.assertEqual(worker.lookup_scheduler(32, ["h0", "h1"], use_layerwise=False), 0)
-        self.assertEqual(worker.m_store.exists.call_count, calls_after_first)
-
     def test_handle_released_saves_noop_without_send_thread(self):
         worker = self._make_worker()
         worker.kv_send_thread = None
         worker.handle_released_saves({"r1"})
-
-    def test_peer_rank_layout_probe_failure_does_not_abort_lookup(self):
-        worker = self._make_worker(
-            kv_role="kv_consumer",
-            extra_config={"backend": "mooncake", "consumer_is_to_load": True, "prefill_pp_size": "1"},
-        )
-        worker.m_store.exists.side_effect = lambda keys: [1] * len(keys)
-        worker._detect_peer_rank_layout = Mock(side_effect=TypeError("unexpected keyword argument"))
-
-        self.assertEqual(worker.lookup_scheduler(32, ["h0", "h1"], use_layerwise=False), 32)
-        self.assertTrue(worker._peer_rank_probe_done)
-        self.assertFalse(worker._peer_rank_layout_mismatch)
 
     def test_handle_released_saves_drains_only_released_requests(self):
         worker = self._make_worker()
@@ -3128,35 +2990,6 @@ class TestKVPoolWorkerTpMismatch(unittest.TestCase):
         self.assertEqual(worker.local_heads_per_rank, 4)
         self.assertEqual(worker.effective_heads_per_rank, 2)
         self.assertEqual(worker.num_sub_keys, 2)
-
-    def test_shared_pool_rejects_silent_multihead_tp_mismatch(self):
-        with self.assertRaisesRegex(ValueError, "TP mismatch"):
-            self._make_worker(
-                tp_size=2,
-                kv_role="kv_consumer",
-                extra_config={
-                    "backend": "mooncake",
-                    "consumer_is_to_load": True,
-                    "prefill_tp_size": 4,
-                },
-                num_kv_heads=3,
-            )
-
-    def test_shared_pool_allows_mla_and_single_head_tp_mismatch(self):
-        for use_mla, num_kv_heads in ((True, 8), (False, 1)):
-            with self.subTest(use_mla=use_mla, num_kv_heads=num_kv_heads):
-                worker = self._make_worker(
-                    tp_size=2,
-                    kv_role="kv_consumer",
-                    extra_config={
-                        "backend": "mooncake",
-                        "consumer_is_to_load": True,
-                        "prefill_tp_size": 4,
-                    },
-                    num_kv_heads=num_kv_heads,
-                    use_mla=use_mla,
-                )
-                self.assertFalse(worker.tp_mismatch)
 
     def test_tp_mismatch_detected_for_both_roles_and_tp_directions(self):
         cases = [

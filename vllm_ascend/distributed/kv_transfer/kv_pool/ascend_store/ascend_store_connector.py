@@ -131,7 +131,6 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.use_layerwise = extra_config.get("use_layerwise", False)
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
-        self.sync_prefill_save = extra_config.get("sync_prefill_save", False)
         self.memcache_dp_init_barrier = extra_config.get("memcache_dp_init_barrier", True)
         self.backend_name = extra_config.get("backend", "mooncake").lower()
         self.backend_class = get_backend_class(self.backend_name) if self.use_layerwise else None
@@ -141,14 +140,6 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             "save_decode_cache", False
         )
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or self.consumer_is_to_put or self.save_decode_cache
-        self._wait_for_save_seen = False
-        if self.sync_prefill_save and (self.kv_role == "kv_consumer" or self.use_layerwise):
-            logger.warning(
-                "sync_prefill_save is a prefill producer option for non-layerwise KV writes; "
-                "it is ignored for kv_role=%s (use_layerwise=%s).",
-                self.kv_role,
-                self.use_layerwise,
-            )
         if (
             self.kv_role == "kv_consumer"
             and self.save_decode_cache
@@ -459,17 +450,6 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         cast(LayerwiseKVPoolWorker, self.connector_worker).save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):
-        if not self._wait_for_save_seen:
-            # One-shot breadcrumb: whether the engine invokes the non-layerwise
-            # save hook at all is the difference between "no write attempted"
-            # and "write attempted but skipped".
-            self._wait_for_save_seen = True
-            logger.info(
-                "KV pool wait_for_save hook entered: kv_role=%s can_put=%s use_layerwise=%s",
-                self.kv_role,
-                self.can_put,
-                self.use_layerwise,
-            )
         if not self.can_put:
             # A load-only consumer has no store thread to wait for.
             return

@@ -47,19 +47,9 @@ The user can enable both features simply by enabling Prefix Caching, which is en
 
 When used together with Mooncake PD (Prefill-Decode) Disaggregation, the KV Cache Pool can further decouple prefill and decode stages across devices or nodes.
 
-Two topologies are supported. In the P2P-assisted topology, Prefill performs
-the KV Pool put/get operations and Decode gets its KV Cache from the Mooncake
-P2P connector (`MooncakeConnector`). In the shared-pool topology, the P2P
-connector is omitted: Prefill writes the prompt KV and Decode reads it directly
-by setting `consumer_is_to_load=true` on its `AscendStoreConnector`.
+Currently, we only perform put and get operations of KV Pool for **Prefill Nodes**, and Decode Nodes get their KV Cache from Mooncake P2P KV Connector, i.e., MooncakeConnector.
 
-The P2P-assisted topology keeps direct NPU-to-NPU transfer efficiency and uses
-the Pool as a reusable prefix cache. The shared-pool topology removes the P2P
-dependency but requires matching Prefill/Decode PP sizes, `use_layerwise=false`
-on both roles, and `load_async=false` for hybrid private state. When the Store
-is the only KV source for the current request, Prefill can set
-`sync_prefill_save=true` to wait for the durable save offset before returning.
-Cross-PP pool lookup/load is not supported and is rejected at startup.
+The key benefit of doing this is that we can keep the gain in performance by computing less with Prefix Caching from on-chip memory and KV Pool for Prefill Nodes, while not sacrificing the data transfer efficiency between Prefill and Decode nodes with P2P KV Connector that transfers KV Caches between NPU devices directly.
 
 To enable this feature, we need to set up both Mooncake Connector and MooncakeStore Connector with a Multi Connector, which is a KV Connector class provided by vLLM that can call multiple KV Connectors in a specific order.
 

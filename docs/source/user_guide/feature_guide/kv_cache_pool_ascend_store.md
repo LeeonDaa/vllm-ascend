@@ -1601,18 +1601,11 @@ Refer to the verification operations in Steps 1–5 of Configuration Examples.
 | `save_decode_cache` | bool | false | No | true / false | Save complete Decode KV blocks. A consumer can enable this without `consumer_is_to_put`, keeping Prefill writes disabled; this consumer mode requires `use_layerwise=false`. |
 | `consumer_is_to_load` | bool | false | No | true / false | Whether Decode node loads KV Cache from KV Pool. |
 | `use_layerwise` | bool | false | No | true / false | Layer-by-layer KV save/load, supported by both Mooncake and Memcache backends. Only supported on the Prefill node. |
-| `sync_prefill_save` | bool | false | No | true / false | Prefill-only, non-layerwise option. Wait for the prompt KV write to become durable before returning the prefill response. Enable it when the Store is the only KV source for Decode (no P2P connector). |
-| `prefill_pp_size` | int | 1 | Required when Prefill PP + consumer writes, or when Decode loads across PP | Positive integer | Prefill PP size. A loading Decode node must match it; cross-PP lookup/load is not supported. |
+| `prefill_pp_size` | int | 1 | Required when Prefill PP + consumer writes | Positive integer | Prefill PP size. |
 | `prefill_pp_layer_partition` | str | No default | No | Comma-separated layer numbers, e.g., "30,31" | Prefill PP layer partition. If not configured, layers are evenly divided by `prefill_pp_size`. |
 | `qos_priority` | int | 0 | No | [0, 4] (integer, larger = higher priority) | KV Pool transfer QoS priority. |
 
 **NOTE:** When using `AscendStoreConnector` together with `MooncakeConnector` (V1) or `MooncakeConnectorV2`, the current TCP port allocations may still overlap ports reserved by other workers or components. This includes V1 worker handshake ports and V2 scheduler control ports. Distinct DP indices do not guarantee disjoint TCP port ranges; check these allocations against worker and component port reservations before deployment. `lookup_rpc_port` only identifies the local IPC endpoint and does not resolve these TCP port conflicts.
-
-When `consumer_is_to_load=true`, set `prefill_pp_size` (or
-`prefill_pp_layer_partition`) so startup can reject a Prefill/Decode PP
-mismatch. Also keep `load_async=false` for hybrid models whose private state
-must be copied after a synchronous load, and use
-`kv_load_failure_policy=fail` for hybrid attention models.
 
 ### ASCEND_GLOBAL_RESOURCE_CONFIG
 
