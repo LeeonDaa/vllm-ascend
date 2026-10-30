@@ -360,6 +360,17 @@ class NPUModelRunner(GPUModelRunner):
 
     @runtime_guard_sample_tokens
     def sample_tokens(self, grammar_output):
+        if not getattr(self, "_kv_diag_sample_logged", False):
+            self._kv_diag_sample_logged = True
+            connector = self.kv_connector
+            inner = getattr(connector, "kv_connector", None)
+            logger.info(
+                "V2 KV diag sample_tokens: state_present=%s connector=%s inner=%s disabled=%s",
+                self.execute_model_state is not None,
+                type(connector).__name__,
+                type(inner).__name__ if inner is not None else None,
+                getattr(connector, "_disabled", None),
+            )
         if (
             lmhead_tp_enable()
             and self.prompt_logprobs_worker is not None
@@ -393,6 +404,12 @@ class NPUModelRunner(GPUModelRunner):
             pcp_manager._sampling_hidden_restored = False
         self._restore_replicated_draft_target_states()
         output = super().sample_tokens(grammar_output)
+        if not getattr(self, "_kv_diag_sample_done_logged", False):
+            self._kv_diag_sample_done_logged = True
+            logger.info(
+                "V2 KV diag sample_tokens done: output=%s",
+                type(output).__name__ if output is not None else None,
+            )
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).
         self._finalize_dump_data()
@@ -654,6 +671,21 @@ class NPUModelRunner(GPUModelRunner):
         randomize_inputs: bool = False,
     ):
         self._cpp_execution_time_ms = None
+        if not dummy_run and not is_profile and not getattr(self, "_kv_diag_exec_logged", False):
+            self._kv_diag_exec_logged = True
+            connector = self.kv_connector
+            inner = getattr(connector, "kv_connector", None)
+            logger.info(
+                "V2 KV diag execute_model: runner=%s connector=%s inner=%s disabled=%s "
+                "has_group=%s spec=%s tokens=%d",
+                type(self).__name__,
+                type(connector).__name__,
+                type(inner).__name__ if inner is not None else None,
+                getattr(connector, "_disabled", None),
+                has_kv_transfer_group(),
+                self.speculative_config is not None,
+                scheduler_output.total_num_scheduled_tokens,
+            )
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
             profiling_config,

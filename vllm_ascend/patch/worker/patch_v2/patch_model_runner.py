@@ -3,6 +3,8 @@
 
 from contextlib import AbstractContextManager
 
+from vllm.distributed.kv_transfer import has_kv_transfer_group
+from vllm.logger import logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
@@ -211,6 +213,12 @@ def initialize_kv_cache(
         self.kv_connector = upstream.NO_OP_KV_CONNECTOR
     else:
         self.kv_connector = upstream.get_kv_connector(self.vllm_config, kv_caches_dict)
+        logger.info(
+            "V2 KV diag initialize_kv_cache: connector=%s has_group=%s is_profiling=%s",
+            type(self.kv_connector).__name__,
+            has_kv_transfer_group(),
+            is_profiling,
+        )
         # vLLM main carries routed-experts output through the AuxOutput
         # connector, which the V2 NPUModelRunner relies on via super().
         if self.vllm_config.aux_output_config.enabled:
